@@ -44,7 +44,7 @@
 #include "arrow/util/bitmap_ops.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/cpu_info.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
@@ -1400,7 +1400,7 @@ TEST(Ordering, IsSuborderOf) {
   Ordering a{{SortKey{3}, SortKey{1}, SortKey{7}}};
   Ordering b{{SortKey{3}, SortKey{1}}};
   Ordering c{{SortKey{1}, SortKey{7}}};
-  Ordering d{{SortKey{1}, SortKey{7}}, NullPlacement::AtEnd};
+  Ordering d{{SortKey{1}, SortKey{7, SortOrder::Ascending, NullPlacement::AtStart}}};
   Ordering imp = Ordering::Implicit();
   Ordering unordered = Ordering::Unordered();
 

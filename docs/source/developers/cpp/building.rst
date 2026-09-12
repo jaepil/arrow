@@ -39,9 +39,9 @@ out-of-source. If you are not familiar with this terminology:
 
 Building requires:
 
-* A C++17-enabled compiler. On Linux, gcc 7.1 and higher should be
-  sufficient. For Windows, at least Visual Studio VS2017 is required.
-* CMake 3.16 or higher
+* A C++20-enabled compiler. On Linux, gcc 12 and higher should be
+  sufficient.
+* CMake 3.25 or higher
 * On Linux and macOS, either ``make`` or ``ninja`` build utilities
 * At least 1GB of RAM for a minimal build, 4GB for a minimal
   debug build with tests and 8GB for a full build using
@@ -314,6 +314,25 @@ The unit tests are not built by default. After building, one can also invoke
 the unit tests using the ``ctest`` tool provided by CMake (note that ``test``
 depends on ``python`` being available).
 
+.. note::
+   If you are building with tests (``-DARROW_BUILD_TESTS=ON``), you must ensure
+   the test data submodules are initialized and the environment variables
+   ``ARROW_TEST_DATA`` and ``PARQUET_TEST_DATA`` are set. Without these, several
+   tests (especially IPC and Parquet tests) will fail with an ``IOError``.
+
+   To initialize submodules, run:
+
+   .. code-block:: shell
+
+      $ git submodule update --init --recursive
+
+   Then set the variables to the absolute paths of your testing data folders:
+
+   .. code-block:: shell
+
+      $ export ARROW_TEST_DATA="<absolute_path_to_arrow>/testing/data"
+      $ export PARQUET_TEST_DATA="<absolute_path_to_arrow>/cpp/submodules/parquet-testing/data"
+
 On some Linux distributions, running the test suite might require setting an
 explicit locale. If you see any locale-related errors, try setting the
 environment variable (which requires the ``locales`` package or equivalent):
@@ -451,7 +470,7 @@ several times with different options if you want to exercise all of them.
 CMake version requirements
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-We support CMake 3.16 and higher.
+We support CMake 3.25 and higher.
 
 LLVM and Clang Tools
 ~~~~~~~~~~~~~~~~~~~~

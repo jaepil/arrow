@@ -28,7 +28,7 @@ from .core import IssueTracker, Release
               callback=validate_arrow_sources,
               help="Specify Arrow source directory.")
 @click.option('--github-token', '-t', default=None,
-              envvar="CROSSBOW_GITHUB_TOKEN",
+              envvar=['GH_TOKEN', 'CROSSBOW_GITHUB_TOKEN'],
               help='OAuth token for GitHub authentication')
 @click.pass_obj
 def release(obj, src, github_token):
@@ -67,13 +67,14 @@ def release_changelog_add(obj, version):
 
     # just handle the current version
     release = Release(version, repo=repo, issue_tracker=issue_tracker)
-    if release.is_released:
-        raise ValueError('This version has been already released!')
 
     changelog = release.changelog()
     changelog_path = pathlib.Path(repo) / 'CHANGELOG.md'
 
     current_content = changelog_path.read_text()
+    if f'# Apache Arrow {version} (' in current_content:
+        raise ValueError(
+            f'CHANGELOG.md already contains the changelog of {version}!')
     new_content = changelog.render('markdown') + current_content
 
     changelog_path.write_text(new_content)
@@ -108,7 +109,7 @@ def release_changelog_regenerate(obj):
             continue
         release = Release(version, repo=repo,
                           issue_tracker=issue_tracker)
-        click.echo('Querying changelog for version: {}'.format(version))
+        click.echo(f'Querying changelog for version: {version}')
         changelogs.append(release.changelog())
 
     click.echo('Rendering new CHANGELOG.md file...')
@@ -139,4 +140,4 @@ def release_cherry_pick(obj, version, dry_run, recreate):
     else:
         click.echo(f'git checkout -b {release.branch} {release.base_branch}')
         for commit in release.commits_to_pick():
-            click.echo('git cherry-pick {}'.format(commit.hexsha))
+            click.echo(f'git cherry-pick {commit.hexsha}')

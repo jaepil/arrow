@@ -38,16 +38,18 @@ update_versions() {
 
   pushd "${ARROW_DIR}/c_glib"
   sed -i.bak -E -e \
-    "s/^version = '.+'/version = '${version}'/" \
+    "s/^    version: '.+'/    version: '${version}'/" \
     meson.build
   rm -f meson.build.bak
   git add meson.build
 
-  # Add a new version entry only when the next release is a new major release
-  if [ "${type}" = "snapshot" -a \
-       "${next_version}" = "${major_version}.0.0" ]; then
+  # Add a new version entry only when the next release is a new major
+  # release and it doesn't exist yet.
+  if [ "${type}" = "snapshot" ] && \
+     [ "${next_version}" = "${major_version}.0.0" ] && \
+     ! grep -q -F "(${major_version}, 0)" tool/generate-version-header.py; then
     sed -i.bak -E -e \
-      "s/^ALL_VERSIONS = \[$/&\\n        (${major_version}, 0),/" \
+      "s/^ALL_VERSIONS = \[$/&\\n    (${major_version}, 0),/" \
       tool/generate-version-header.py
     rm -f tool/generate-version-header.py.bak
     git add tool/generate-version-header.py
@@ -76,29 +78,16 @@ update_versions() {
   git add CMakeLists.txt
 
   sed -i.bak -E -e \
+    "s/^    version: '.+'/    version: '${version}'/" \
+    meson.build
+  rm -f meson.build.bak
+  git add meson.build
+
+  sed -i.bak -E -e \
     "s/\"version-string\": \".+\"/\"version-string\": \"${version}\"/" \
     vcpkg.json
   rm -f vcpkg.json.bak
   git add vcpkg.json
-  popd
-
-  pushd "${ARROW_DIR}/java"
-  mvn versions:set -DnewVersion=${version} -DprocessAllModules -DgenerateBackupPoms=false
-  if [ "${type}" = "release" ]; then
-    # versions-maven-plugin:set-scm-tag does not update the whole reactor. Invoking separately
-    mvn versions:set-scm-tag -DnewTag=apache-arrow-${version} -DgenerateBackupPoms=false -pl :arrow-java-root
-    mvn versions:set-scm-tag -DnewTag=apache-arrow-${version} -DgenerateBackupPoms=false -pl :arrow-bom
-  fi
-  git add "pom.xml"
-  git add "**/pom.xml"
-  popd
-
-  pushd "${ARROW_DIR}/csharp"
-  sed -i.bak -E -e \
-    "s/^    <Version>.+<\/Version>/    <Version>${version}<\/Version>/" \
-    Directory.Build.props
-  rm -f Directory.Build.props.bak
-  git add Directory.Build.props
   popd
 
   pushd "${ARROW_DIR}/dev/tasks/homebrew-formulae"
@@ -112,14 +101,6 @@ update_versions() {
   git add \
     apache-arrow-glib.rb \
     apache-arrow.rb
-  popd
-
-  pushd "${ARROW_DIR}/js"
-  sed -i.bak -E -e \
-    "s/^  \"version\": \".+\"/  \"version\": \"${version}\"/" \
-    package.json
-  rm -f package.json.bak
-  git add package.json
   popd
 
   pushd "${ARROW_DIR}/matlab"
@@ -212,12 +193,22 @@ so_version() {
   expr ${major_version} \* 100 + ${minor_version}
 }
 
+gir_api_version() {
+  local version=$1
+  local major_version=$(echo ${version} | cut -d. -f1)
+  local minor_version=$(echo ${version} | cut -d. -f2)
+  echo "${major_version}.${minor_version}"
+}
+
 update_deb_package_names() {
   local version=$1
   local next_version=$2
   echo "Updating .deb package names for ${next_version}"
-  deb_lib_suffix=$(so_version ${version})
-  next_deb_lib_suffix=$(so_version ${next_version})
+
+  local substituted=false
+
+  local deb_lib_suffix=$(so_version ${version})
+  local next_deb_lib_suffix=$(so_version ${next_version})
   if [ "${deb_lib_suffix}" != "${next_deb_lib_suffix}" ]; then
     pushd ${ARROW_DIR}/dev/tasks/linux-packages/apache-arrow
     for target in debian*/lib*${deb_lib_suffix}.install; do
@@ -225,18 +216,33 @@ update_deb_package_names() {
         ${target} \
         $(echo ${target} | sed -e "s/${deb_lib_suffix}/${next_deb_lib_suffix}/")
     done
-    deb_lib_suffix_substitute_pattern="s/(lib(arrow|gandiva|parquet)[-a-z]*)${deb_lib_suffix}/\\1${next_deb_lib_suffix}/g"
+    local deb_lib_suffix_substitute_pattern="s/(lib(arrow|gandiva|parquet)[-a-z]*)${deb_lib_suffix}/\\1${next_deb_lib_suffix}/g"
     sed -i.bak -E -e "${deb_lib_suffix_substitute_pattern}" debian*/control*
     rm -f debian*/control*.bak
     git add debian*/control*
+    substituted=true
     popd
+  fi
 
-    pushd ${ARROW_DIR}/dev/release
-    sed -i.bak -E -e "${deb_lib_suffix_substitute_pattern}" rat_exclude_files.txt
-    rm -f rat_exclude_files.txt.bak
-    git add rat_exclude_files.txt
-    git commit -m "MINOR: [Release] Update .deb package names for ${next_version}"
+  local deb_gir_suffix=$(gir_api_version ${version})
+  local next_deb_gir_suffix=$(gir_api_version ${next_version})
+  if [ "${deb_gir_suffix}" != "${next_deb_gir_suffix}" ]; then
+    pushd ${ARROW_DIR}/dev/tasks/linux-packages/apache-arrow
+    for target in debian*/gir1.2-*-${deb_gir_suffix}.install; do
+      git mv \
+        ${target} \
+        $(echo ${target} | sed -e "s/${deb_gir_suffix}/${next_deb_gir_suffix}/")
+    done
+    local deb_gir_suffix_substitute_pattern="s/(gir1\\.2-(arrow|gandiva|parquet)[-a-z]*)${deb_gir_suffix}/\\1${next_deb_gir_suffix}/g"
+    sed -i.bak -E -e "${deb_gir_suffix_substitute_pattern}" debian*/control*
+    rm -f debian*/control*.bak
+    git add debian*/control*
+    substituted=true
     popd
+  fi
+
+  if [ "${substituted}" = "true" ]; then
+    git commit -m "MINOR: [Release] Update .deb package names for ${next_version}"
   fi
 }
 

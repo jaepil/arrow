@@ -16,12 +16,13 @@
 # under the License.
 
 ARG repo
-ARG arch=amd64
-ARG python=3.9
-FROM ${repo}:${arch}-conda-python-${python}
+ARG arch
+ARG arch_short
+ARG python=3.11
+FROM --platform=linux/${arch} ${repo}:${arch_short}-conda-python-${python}
 
 ARG jdk=11
-ARG maven=3.8.7
+ARG maven=3.9.9
 
 ARG numpy=latest
 COPY ci/scripts/install_numpy.sh /arrow/ci/scripts/
@@ -30,7 +31,7 @@ RUN mamba install -q -y \
         openjdk=${jdk} \
         maven=${maven} \
         pandas && \
-    mamba clean --all && \
+    mamba clean --all --yes && \
     mamba uninstall -q -y numpy && \
     /arrow/ci/scripts/install_numpy.sh ${numpy}
 

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM ubuntu:focal
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -25,7 +25,6 @@ RUN apt-get update -y -q && \
       cmake \
       libboost-filesystem-dev \
       libboost-regex-dev \
-      libboost-system-dev \
       libbrotli-dev \
       libbz2-dev \
       libgflags-dev \

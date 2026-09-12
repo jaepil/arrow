@@ -18,15 +18,19 @@
 
 set -ex
 
-: ${R_BIN:=R}
+: "${R_BIN:=R}"
 
-source_dir=${1}/r
+source_dir="${1}/r"
 
-pushd ${source_dir}
+pushd "${source_dir}"
 
 printenv
 
 if [ -n "${ARROW_PYTHON_VENV:-}" ]; then
+  # We don't need to follow this external file.
+  # See also: https://www.shellcheck.net/wiki/SC1091
+  #
+  # shellcheck source=/dev/null
   . "${ARROW_PYTHON_VENV}/bin/activate"
 fi
 
@@ -47,8 +51,8 @@ if [ "$ARROW_R_FORCE_TESTS" = "true" ]; then
 fi
 
 if [ "$ARROW_USE_PKG_CONFIG" != "false" ]; then
-  export LD_LIBRARY_PATH=${ARROW_HOME}/lib:${LD_LIBRARY_PATH}
-  export R_LD_LIBRARY_PATH=${LD_LIBRARY_PATH}
+  export LD_LIBRARY_PATH="${ARROW_HOME}/lib:${LD_LIBRARY_PATH}"
+  export R_LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
 fi
 
 export _R_CHECK_COMPILATION_FLAGS_KNOWN_="${_R_CHECK_COMPILATION_FLAGS_KNOWN_} ${ARROW_R_CXXFLAGS}"
@@ -91,7 +95,9 @@ export TEXMFVAR=/tmp/texmf-var
 BEFORE=$(ls -alh ~/)
 
 SCRIPT="as_cran <- !identical(tolower(Sys.getenv('NOT_CRAN')), 'true')
-  if (as_cran) {
+  # generally will be false, but we can override it by setting SKIP_VIGNETTES=true
+  skip_vignettes <- identical(tolower(Sys.getenv('SKIP_VIGNETTES')), 'true')
+  if (as_cran && !skip_vignettes) {
     args <- '--as-cran'
     build_args <- character()
   } else {
@@ -99,7 +105,7 @@ SCRIPT="as_cran <- !identical(tolower(Sys.getenv('NOT_CRAN')), 'true')
     build_args <- '--no-build-vignettes'
   }
 
-  if (requireNamespace('reticulate', quietly = TRUE) && reticulate::py_module_available('pyarrow')) {
+  if (!as_cran && requireNamespace('reticulate', quietly = TRUE) && reticulate::py_module_available('pyarrow')) {
       message('Running flight demo server for tests.')
       pid_flight <- sys::exec_background(
           'python',
@@ -124,11 +130,12 @@ SCRIPT="as_cran <- !identical(tolower(Sys.getenv('NOT_CRAN')), 'true')
   print(args)
 
   rcmdcheck::rcmdcheck(build_args = build_args, args = args, error_on = 'warning', check_dir = 'check', timeout = 3600)"
-echo "$SCRIPT" | ${R_BIN} --no-save
+echo "$SCRIPT" | "${R_BIN}" --no-save
 
 AFTER=$(ls -alh ~/)
 if [ "$NOT_CRAN" != "true" ] && [ "$BEFORE" != "$AFTER" ]; then
-  ls -alh ~/.cmake/packages
+  # Ignore ~/.TinyTex/ and ~/R/ because it has many files.
+  find ~ -path ~/.TinyTeX -prune -or -path ~/R/ -prune -or -print
   exit 1
 fi
 popd

@@ -18,7 +18,7 @@
 # Includes code assembled from BSD/MIT/Apache-licensed code from some 3rd-party
 # projects, including Kudu, Impala, and libdynd. See python/LICENSE.txt
 
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.25)
 project(pyarrow)
 
 # This is needed for 3.13 free-threading. CMake used to add Python
@@ -28,7 +28,7 @@ project(pyarrow)
 # which in turn meant that Py_GIL_DISABLED was not set.
 set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
 
-set(PYARROW_VERSION "19.0.0-SNAPSHOT")
+set(PYARROW_VERSION "26.0.0-SNAPSHOT")
 string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" PYARROW_BASE_VERSION "${PYARROW_VERSION}")
 
 # Generate SO version and full SO version
@@ -130,11 +130,18 @@ if(CCACHE_FOUND
    AND NOT CMAKE_C_COMPILER_LAUNCHER
    AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
   message(STATUS "Using ccache: ${CCACHE_FOUND}")
-  set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_FOUND})
-  set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_FOUND})
-  # ARROW-3985: let ccache preserve C++ comments, because some of them may be
-  # meaningful to the compiler
-  set(ENV{CCACHE_COMMENTS} "1")
+  # 1. Let ccache preserve C++ comments, because some of them may be
+  #    meaningful to the compiler (ARROW-3985)
+  # 2. Set ccache base_dir to the build output directory as it is typically
+  #    a temporary directory, and would otherwise fail caching because of
+  #    using different paths everytime.
+  # Also, we use `cmake -E env` to set environment variables as the
+  # `ccache option=value ...` form of passing configuration options
+  # is not supported by ccache < 4.8.
+  set(ccache_command ${CMAKE_COMMAND} -E env CCACHE_COMMENTS=1
+                     CCACHE_BASEDIR=${CMAKE_BINARY_DIR} -- ${CCACHE_FOUND})
+  set(CMAKE_C_COMPILER_LAUNCHER ${ccache_command})
+  set(CMAKE_CXX_COMPILER_LAUNCHER ${ccache_command})
 endif()
 
 #
@@ -166,8 +173,8 @@ if($ENV{PYODIDE})
   # modules (at least under Pyodide it does).
   set(Python3_INCLUDE_DIR $ENV{PYTHONINCLUDE})
   set(Python3_LIBRARY $ENV{CPYTHONLIB})
-  set(Python3_NumPy_INCLUDE_DIR $ENV{NUMPY_LIB}/core/include)
   set(Python3_EXECUTABLE)
+  set(Python3_NumPy_INCLUDE_DIR $ENV{NUMPY_LIB}/_core/include)
   set(ENV{_PYTHON_SYSCONFIGDATA_NAME} $ENV{SYSCONFIG_NAME})
   # we set the c and cxx compiler manually to bypass pywasmcross
   # which is pyodide's way of messing with C++ build parameters.
@@ -190,10 +197,6 @@ if(MSVC)
   # Converting to/from C++ bool is pretty wonky in Cython. The C4800 warning
   # seem harmless, and probably not worth the effort of working around it
   string(APPEND CMAKE_CXX_FLAGS " /wd4800")
-
-  # See https://github.com/cython/cython/issues/2731. Change introduced in
-  # Cython 0.29.1 causes "unsafe use of type 'bool' in operation"
-  string(APPEND CMAKE_CXX_FLAGS " /wd4804")
 
   # See https://github.com/cython/cython/issues/4445.
   #
@@ -225,7 +228,7 @@ endif()
 # For any C code, use the same flags.
 set(CMAKE_C_FLAGS "${CMAKE_CXX_FLAGS}")
 
-# Add C++-only flags, like -std=c++17
+# Add C++-only flags, like -std=c++20
 set(CMAKE_CXX_FLAGS "${CXX_ONLY_FLAGS} ${CMAKE_CXX_FLAGS}")
 
 message(STATUS "CMAKE_C_FLAGS: ${CMAKE_C_FLAGS}")
@@ -273,15 +276,33 @@ set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}")
 
 # Python and Numpy libraries
 find_package(Python3Alt REQUIRED)
+if(Python3_NumPy_VERSION AND Python3_NumPy_VERSION VERSION_LESS "2.0")
+  message(FATAL_ERROR "PyArrow requires NumPy 2.0 or newer, found ${Python3_NumPy_VERSION}"
+  )
+endif()
 message(STATUS "Found NumPy version: ${Python3_NumPy_VERSION}")
 message(STATUS "NumPy include dir: ${NUMPY_INCLUDE_DIRS}")
 
 include(UseCython)
+
+if(CYTHON_VERSION VERSION_LESS "3.1")
+  message(FATAL_ERROR "Please update your Cython version. Supported Cython >= 3.1, found ${CYTHON_VERSION}"
+  )
+endif()
 message(STATUS "Found Cython version: ${CYTHON_VERSION}")
 
 # Arrow C++ and set default PyArrow build options
 include(GNUInstallDirs)
 find_package(Arrow REQUIRED)
+
+# When not bundling Arrow C++ libraries on macOS, add the Arrow library
+# directory to the RPATH so that the extensions can find libarrow at runtime.
+if(APPLE
+   AND NOT PYARROW_BUNDLE_ARROW_CPP
+   AND ARROW_SHARED_LIB)
+  get_filename_component(_arrow_lib_dir "${ARROW_SHARED_LIB}" DIRECTORY)
+  list(APPEND CMAKE_INSTALL_RPATH "${_arrow_lib_dir}")
+endif()
 
 macro(define_option name description arrow_option)
   set("PYARROW_${name}"
@@ -345,13 +366,31 @@ endif()
 # PyArrow C++
 set(PYARROW_CPP_ROOT_DIR pyarrow/src)
 set(PYARROW_CPP_SOURCE_DIR ${PYARROW_CPP_ROOT_DIR}/arrow/python)
+
+# Write out compile-time configuration constants
+if(CMAKE_BUILD_TYPE)
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" UPPERCASE_PYBUILD_TYPE)
+else()
+  # For multi-config generators (XCode and Visual Studio),
+  # CMAKE_BUILD_TYPE is not set at configure time.
+  # scikit-build-core does the right thing with cmake.build-type and
+  # adds the corresponding --config but does not populate CMAKE_BUILD_TYPE
+  # for those. On this specific case, we set the default to "RELEASE".
+  # The actual build type is injected through target compile definitions
+  # for multi-config generators.
+  set(UPPERCASE_PYBUILD_TYPE "RELEASE")
+endif()
+
+configure_file("${PYARROW_CPP_SOURCE_DIR}/config_internal.h.cmake"
+               "${PYARROW_CPP_SOURCE_DIR}/config_internal.h" ESCAPE_QUOTES)
+
 set(PYARROW_CPP_SRCS
     ${PYARROW_CPP_SOURCE_DIR}/arrow_to_pandas.cc
     ${PYARROW_CPP_SOURCE_DIR}/benchmark.cc
     ${PYARROW_CPP_SOURCE_DIR}/common.cc
+    ${PYARROW_CPP_SOURCE_DIR}/config.cc
     ${PYARROW_CPP_SOURCE_DIR}/datetime.cc
     ${PYARROW_CPP_SOURCE_DIR}/decimal.cc
-    ${PYARROW_CPP_SOURCE_DIR}/deserialize.cc
     ${PYARROW_CPP_SOURCE_DIR}/extension_type.cc
     ${PYARROW_CPP_SOURCE_DIR}/gdb.cc
     ${PYARROW_CPP_SOURCE_DIR}/helpers.cc
@@ -364,11 +403,10 @@ set(PYARROW_CPP_SRCS
     ${PYARROW_CPP_SOURCE_DIR}/python_test.cc
     ${PYARROW_CPP_SOURCE_DIR}/python_to_arrow.cc
     ${PYARROW_CPP_SOURCE_DIR}/pyarrow.cc
-    ${PYARROW_CPP_SOURCE_DIR}/serialize.cc
-    ${PYARROW_CPP_SOURCE_DIR}/udf.cc)
+    ${PYARROW_CPP_SOURCE_DIR}/udf.cc
+    ${PYARROW_CPP_SOURCE_DIR}/util.cc)
 set_source_files_properties(${PYARROW_CPP_SOURCE_DIR}/numpy_init.cc
-                            PROPERTIES SKIP_PRECOMPILE_HEADERS ON
-                                       SKIP_UNITY_BUILD_INCLUSION ON)
+                            PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 set(PYARROW_CPP_LINK_LIBS "")
 
@@ -424,6 +462,19 @@ if(PYARROW_BUILD_ACERO)
   endif()
 endif()
 
+# Currently PyArrow cannot be built without ARROW_COMPUTE
+if(NOT ARROW_COMPUTE)
+  message(FATAL_ERROR "You must build Arrow C++ with ARROW_COMPUTE=ON")
+else()
+  message(STATUS "Building PyArrow with Compute")
+  find_package(ArrowCompute REQUIRED)
+  if(ARROW_BUILD_SHARED)
+    list(APPEND PYARROW_CPP_LINK_LIBS ArrowCompute::arrow_compute_shared)
+  else()
+    list(APPEND PYARROW_CPP_LINK_LIBS ArrowCompute::arrow_compute_static)
+  endif()
+endif()
+
 if(PYARROW_BUILD_PARQUET)
   message(STATUS "Building PyArrow with Parquet")
   if(NOT ARROW_PARQUET)
@@ -441,6 +492,8 @@ endif()
 # Check for only Arrow C++ options
 if(ARROW_CSV)
   list(APPEND PYARROW_CPP_SRCS ${PYARROW_CPP_SOURCE_DIR}/csv.cc)
+else()
+  message(FATAL_ERROR "You must build Arrow C++ with ARROW_CSV=ON")
 endif()
 
 if(ARROW_FILESYSTEM)
@@ -464,10 +517,6 @@ endif()
 add_library(arrow_python SHARED ${PYARROW_CPP_SRCS})
 target_include_directories(arrow_python PUBLIC ${PYARROW_CPP_ROOT_DIR}
                                                ${CMAKE_CURRENT_BINARY_DIR}/pyarrow/src)
-if(ARROW_USE_PRECOMPILED_HEADERS)
-  target_precompile_headers(arrow_python PUBLIC
-                            "$<$<COMPILE_LANGUAGE:CXX>:arrow/python/pch.h>")
-endif()
 
 # on static builds we need to be careful not to link PYARROW_CPP_LINK_LIBS
 # into everything depending on arrow_python, or else we get duplicate
@@ -480,6 +529,9 @@ else()
 endif()
 target_link_libraries(arrow_python PUBLIC Python3::NumPy)
 target_compile_definitions(arrow_python PRIVATE ARROW_PYTHON_EXPORTING)
+if(CMAKE_CONFIGURATION_TYPES)
+  target_compile_definitions(arrow_python PRIVATE PYARROW_BUILD_TYPE="$<CONFIG>")
+endif()
 set_target_properties(arrow_python PROPERTIES VERSION "${PYARROW_FULL_SO_VERSION}"
                                               SOVERSION "${PYARROW_SO_VERSION}")
 install(TARGETS arrow_python
@@ -645,12 +697,13 @@ get_filename_component(ARROW_INCLUDE_ARROW_DIR_REAL ${ARROW_INCLUDE_DIR}/arrow R
 install(DIRECTORY ${ARROW_INCLUDE_ARROW_DIR_REAL} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(PYARROW_BUNDLE_ARROW_CPP)
-  # Arrow
+  # Arrow and Compute
   bundle_arrow_lib(${ARROW_SHARED_LIB} SO_VERSION ${ARROW_SO_VERSION})
+  bundle_arrow_lib(${ARROW_COMPUTE_SHARED_LIB} SO_VERSION ${ARROW_SO_VERSION})
 
   if(MSVC)
-    # TODO(kszucs): locate msvcp140.dll in a portable fashion and bundle it
     bundle_arrow_import_lib(${ARROW_IMPORT_LIB})
+    bundle_arrow_import_lib(${ARROW_COMPUTE_IMPORT_LIB})
   endif()
 endif()
 
@@ -926,6 +979,9 @@ foreach(module ${CYTHON_EXTENSIONS})
         continue()
       endif()
     endif()
+    if(output MATCHES "\\.h$")
+      continue()
+    endif()
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${output} DESTINATION ".")
   endforeach()
 endforeach()
@@ -983,3 +1039,44 @@ if(PYARROW_BUILD_PARQUET)
     target_link_libraries(_parquet_encryption PRIVATE arrow_python_parquet_encryption)
   endif()
 endif()
+
+#
+# Type stubs with docstring injection
+#
+# TODO(GH-32609): Reintroduce type stubs into PyArrow wheels.
+# GH-49831: Temporarily do not install pyarrow-stubs into wheels.
+# Stubs live in pyarrow-stubs/pyarrow/ during development but are installed
+# alongside the package so type checkers can find them (PEP 561).
+# The stubs are currently incomplete, and some type checkers consume .pyi files
+# even without the py.typed marker. Re-enable this when the stubs are complete.
+if(PYARROW_REQUIRE_STUB_DOCSTRINGS)
+  message(FATAL_ERROR "PYARROW_REQUIRE_STUB_DOCSTRINGS cannot be used while "
+                      "pyarrow-stubs are omitted from wheels (GH-49831).")
+endif()
+# set(PYARROW_STUBS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/pyarrow-stubs/pyarrow")
+# if(EXISTS "${PYARROW_STUBS_SOURCE_DIR}")
+#   install(DIRECTORY "${PYARROW_STUBS_SOURCE_DIR}/"
+#           DESTINATION "."
+#           FILES_MATCHING
+#           PATTERN "*.pyi")
+#
+#   if(PYARROW_REQUIRE_STUB_DOCSTRINGS)
+#     install(CODE "
+#       execute_process(
+#         COMMAND \"${Python3_EXECUTABLE}\"
+#                 \"${CMAKE_CURRENT_SOURCE_DIR}/scripts/update_stub_docstrings.py\"
+#                 \"${CMAKE_INSTALL_PREFIX}\"
+#                 \"${CMAKE_CURRENT_SOURCE_DIR}\"
+#         RESULT_VARIABLE _pyarrow_stub_docstrings_result
+#       )
+#       if(NOT _pyarrow_stub_docstrings_result EQUAL 0)
+#         message(FATAL_ERROR \"Stub docstring injection failed (exit code: \${_pyarrow_stub_docstrings_result})\")
+#       endif()
+#     ")
+#   endif()
+# else()
+#   if(PYARROW_REQUIRE_STUB_DOCSTRINGS)
+#     message(FATAL_ERROR "PyArrow stub source directory not found at ${PYARROW_STUBS_SOURCE_DIR}; "
+#                         "cannot build wheel without .pyi files.")
+#   endif()
+# endif()

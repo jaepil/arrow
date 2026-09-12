@@ -30,6 +30,22 @@ module Arrow
       @container.share_input(@data)
     end
 
+    def to_arrow
+      @data
+    end
+
+    def to_arrow_array
+      @data.to_arrow_array
+    end
+
+    def to_arrow_chunked_array
+      @data.to_arrow_chunked_array
+    end
+
+    def values
+      @data.values
+    end
+
     def name
       @field.name
     end
@@ -58,11 +74,11 @@ module Arrow
       @data.reverse_each(&block)
     end
 
-    def n_rows
-      @data.n_rows
+    def size
+      @data.size
     end
-    alias_method :size, :n_rows
-    alias_method :length, :n_rows
+    alias_method :length, :size
+    alias_method :n_rows, :size
 
     def n_nulls
       @data.n_nulls

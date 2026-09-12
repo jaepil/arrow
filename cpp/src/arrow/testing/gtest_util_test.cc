@@ -15,20 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cmath>
+#include <memory>
+#include <vector>
+
+#include <gtest/gtest-spi.h>
 #include <gtest/gtest.h>
 
 #include "arrow/array.h"
 #include "arrow/array/builder_decimal.h"
 #include "arrow/datum.h"
 #include "arrow/record_batch.h"
+#include "arrow/table.h"
 #include "arrow/tensor.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/testing/math.h"
 #include "arrow/testing/random.h"
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/float16.h"
 
-namespace arrow {
+namespace arrow::util {
 
 // Test basic cases for contains NaN.
 class TestAssertContainsNaN : public ::testing::Test {};
@@ -171,4 +179,41 @@ TEST_F(TestTensorFromJSON, FromJSON) {
   EXPECT_TRUE(tensor_expected->Equals(*result));
 }
 
-}  // namespace arrow
+TEST_F(TestTensorFromJSON, FromJSONWithStridesAndDimNames) {
+  std::vector<int64_t> shape = {2, 3};
+  std::vector<int64_t> strides = {sizeof(int64_t) * 3, sizeof(int64_t)};
+  std::vector<std::string> dim_names = {"row", "column"};
+  std::vector<int64_t> values = {1, 2, 3, 4, 5, 6};
+  auto data = Buffer::Wrap(values);
+
+  std::shared_ptr<Tensor> tensor_expected;
+  ASSERT_OK_AND_ASSIGN(tensor_expected,
+                       Tensor::Make(int64(), data, shape, strides, dim_names));
+
+  std::shared_ptr<Tensor> result = TensorFromJSON(int64(), "[1, 2, 3, 4, 5, 6]", "[2, 3]",
+                                                  "[24, 8]", R"(["row", "column"])");
+
+  EXPECT_TRUE(tensor_expected->Equals(*result));
+}
+
+TEST(AssertTestWithinUlp, Basics) {
+  AssertWithinUlp(123.4567, 123.45670000000015, 11);
+  AssertWithinUlp(123.456f, 123.456085f, 11);
+  AssertWithinUlp(Float16(123.456f), Float16(124.143501f), 11);
+  AssertWithinUlp(std::numeric_limits<float>::quiet_NaN(),
+                  std::numeric_limits<float>::quiet_NaN(), 2);
+  AssertWithinUlp(std::numeric_limits<double>::quiet_NaN(),
+                  std::numeric_limits<double>::quiet_NaN(), 2);
+  AssertWithinUlp(std::numeric_limits<Float16>::quiet_NaN(),
+                  std::numeric_limits<Float16>::quiet_NaN(), 2);
+#ifndef _WIN32
+  // GH-47442
+  EXPECT_FATAL_FAILURE(AssertWithinUlp(123.4567, 123.45670000000015, 10),
+                       "not within 10 ulps");
+  EXPECT_FATAL_FAILURE(AssertWithinUlp(123.456f, 123.456085f, 10), "not within 10 ulps");
+  EXPECT_FATAL_FAILURE(AssertWithinUlp(Float16(123.456f), Float16(124.143501f), 10),
+                       "not within 10 ulps");
+#endif
+}
+
+}  // namespace arrow::util

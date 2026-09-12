@@ -25,26 +25,6 @@
   - any-glob-to-any-file:
     - c_glib/**/*
 
-"Component: C#":
-- changed-files:
-  - any-glob-to-any-file:
-    - csharp/**/*
-
-"Component: Go":
-- changed-files:
-  - any-glob-to-any-file:
-    - go/**/*
-
-"Component: Java":
-- changed-files:
-  - any-glob-to-any-file:
-    - java/**/*
-
-"Component: JavaScript":
-- changed-files:
-  - any-glob-to-any-file:
-    - js/**/*
-
 "Component: MATLAB":
 - changed-files:
   - any-glob-to-any-file:
@@ -65,11 +45,6 @@
   - any-glob-to-any-file:
     - ruby/**/*
 
-"Component: Swift":
-- changed-files:
-  - any-glob-to-any-file:
-    - swift/**/*
-
 "Component: FlightRPC":
 - changed-files:
   - any-glob-to-any-file:
@@ -82,7 +57,6 @@
   - any-glob-to-any-file:
     - c_glib/gandiva-glib/**/*
     - cpp/src/gandiva/**/*
-    - java/gandiva/**/*
     - python/pyarrow/gandiva.*
     - ruby/red-gandiva/**/*
 

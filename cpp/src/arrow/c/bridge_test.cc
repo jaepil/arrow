@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <deque>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -31,7 +32,6 @@
 #include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
 #include "arrow/c/util_internal.h"
-#include "arrow/ipc/json_simple.h"
 #include "arrow/memory_pool.h"
 #include "arrow/testing/builder.h"
 #include "arrow/testing/extension_type.h"
@@ -43,7 +43,7 @@
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/endian.h"
 #include "arrow/util/key_value_metadata.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/range.h"
 #include "arrow/util/thread_pool.h"
@@ -575,14 +575,22 @@ struct ArrayExportChecker {
     ASSERT_EQ(c_export->null_count, expected_data.null_count);
     ASSERT_EQ(c_export->offset, expected_data.offset);
 
+    const DataType* physical_type = expected_data.type.get();
+    if (physical_type->id() == Type::EXTENSION) {
+      physical_type =
+          checked_cast<const ExtensionType&>(*physical_type).storage_type().get();
+    }
+
     auto expected_n_buffers = static_cast<int64_t>(expected_data.buffers.size());
     auto expected_buffers = expected_data.buffers.data();
-    if (!internal::may_have_validity_bitmap(expected_data.type->id())) {
+    if (!internal::may_have_validity_bitmap(physical_type->id())) {
       --expected_n_buffers;
       ++expected_buffers;
     }
-    bool has_variadic_buffer_sizes = expected_data.type->id() == Type::STRING_VIEW ||
-                                     expected_data.type->id() == Type::BINARY_VIEW;
+
+    bool has_variadic_buffer_sizes =
+        expected_data.type->storage_id() == Type::BINARY_VIEW ||
+        expected_data.type->storage_id() == Type::STRING_VIEW;
     ASSERT_EQ(c_export->n_buffers, expected_n_buffers + has_variadic_buffer_sizes);
     ASSERT_NE(c_export->buffers, nullptr);
 
@@ -591,8 +599,8 @@ struct ArrayExportChecker {
       ASSERT_EQ(c_export->buffers[i], expected_ptr);
     }
     if (has_variadic_buffer_sizes) {
-      auto variadic_buffers = util::span(expected_data.buffers).subspan(2);
-      auto variadic_buffer_sizes = util::span(
+      auto variadic_buffers = std::span(expected_data.buffers).subspan(2);
+      auto variadic_buffer_sizes = std::span(
           static_cast<const int64_t*>(c_export->buffers[c_export->n_buffers - 1]),
           variadic_buffers.size());
       for (auto [buf, size] : Zip(variadic_buffers, variadic_buffer_sizes)) {
@@ -928,6 +936,28 @@ TEST_F(TestArrayExport, PrimitiveSliced) {
   TestPrimitive(factory);
 }
 
+TEST_F(TestArrayExport, RejectNullVariadicBuffers) {
+  // GH-49740: _export_to_c segmentation fault for binary_view array.
+  for (const auto& type : {binary_view(), utf8_view()}) {
+    auto arr =
+        MakeArray(ArrayData::Make(type, /*length=*/2,
+                                  {nullptr,
+                                   Buffer::FromVector(std::vector<BinaryViewType::c_type>{
+                                       util::ToInlineBinaryView("hello"),
+                                       util::ToInlineBinaryView("world"),
+                                   }),
+                                   nullptr}));
+
+    struct ArrowArray c_export;
+    EXPECT_RAISES_WITH_MESSAGE_THAT(
+        Invalid,
+        ::testing::HasSubstr(
+            "Cannot export array of type " + type->ToString() +
+            ": null variadic buffer at buffer index #2 (variadic buffer index #0)"),
+        ExportArray(*arr, &c_export));
+  }
+}
+
 constexpr std::string_view binary_view_buffer_content0 = "12345foo bar baz quux",
                            binary_view_buffer_content1 = "BinaryViewMultipleBuffers";
 
@@ -958,6 +988,13 @@ TEST_F(TestArrayExport, BinaryViewMultipleBuffers) {
   TestPrimitive([&] {
     auto arr = MakeBinaryViewArrayWithMultipleDataBuffers();
     return arr->Slice(1, arr->length() - 2);
+  });
+}
+
+TEST_F(TestArrayExport, BinaryViewExtensionWithMultipleBuffers) {
+  TestPrimitive([&] {
+    auto storage = MakeBinaryViewArrayWithMultipleDataBuffers();
+    return BinaryViewExtensionType::WrapArray(binary_view_extension_type(), storage);
   });
 }
 
@@ -1142,6 +1179,8 @@ TEST_F(TestArrayExport, Extension) {
   TestPrimitive(ExampleUuid);
   TestPrimitive(ExampleSmallint);
   TestPrimitive(ExampleComplex128);
+  TestPrimitive(ExampleDenseUnionExtension);
+  TestPrimitive(ExampleSparseUnionExtension);
 }
 
 TEST_F(TestArrayExport, MovePrimitive) {
@@ -2349,6 +2388,34 @@ TEST_F(TestSchemaImport, DictionaryError) {
   CheckImportError();
 }
 
+TEST_F(TestSchemaImport, DecimalError) {
+  // Decimal precision out of bounds
+  FillPrimitive("d:0,10");
+  CheckImportError();
+  FillPrimitive("d:39,10");
+  CheckImportError();
+
+  FillPrimitive("d:0,4,32");
+  CheckImportError();
+  FillPrimitive("d:10,4,32");
+  CheckImportError();
+
+  FillPrimitive("d:0,4,64");
+  CheckImportError();
+  FillPrimitive("d:19,4,64");
+  CheckImportError();
+
+  FillPrimitive("d:0,10,128");
+  CheckImportError();
+  FillPrimitive("d:39,10,128");
+  CheckImportError();
+
+  FillPrimitive("d:0,4,256");
+  CheckImportError();
+  FillPrimitive("d:77,4,256");
+  CheckImportError();
+}
+
 TEST_F(TestSchemaImport, ExtensionError) {
   ExtensionTypeGuard guard(uuid());
 
@@ -2957,6 +3024,43 @@ TEST_F(TestArrayImport, String) {
   CheckImport(ArrayFromJSON(utf8(), "[]"));
   FillStringLike(0, 0, 0, large_string_buffers_omitted);
   CheckImport(ArrayFromJSON(large_binary(), "[]"));
+}
+
+TEST_F(TestArrayImport, NullVariadicBuffers) {
+  // The C Data Interface allows null variadic buffer pointers with size 0.
+  // Import normalizes them to non-null zero-size buffers in Arrow C++.
+  std::vector<BinaryViewType::c_type> views = {
+      util::ToInlineBinaryView("hello"),
+      util::ToInlineBinaryView("world"),
+  };
+  constexpr int64_t null_variadic_buffer_sizes[] = {0};
+  const void* null_variadic_buffer[] = {
+      nullptr,
+      views.data(),
+      nullptr,
+      null_variadic_buffer_sizes,
+  };
+
+  for (const auto& type : {binary_view(), utf8_view()}) {
+    FillStringViewLike(/*length=*/2, /*null_count=*/0, /*offset=*/0, null_variadic_buffer,
+                       /*data_buffer_count=*/1);
+
+    ArrayReleaseCallback cb(&c_struct_);
+    ASSERT_OK_AND_ASSIGN(auto array, ImportArray(&c_struct_, type));
+    ASSERT_TRUE(ArrowArrayIsReleased(&c_struct_));
+    Reset();
+
+    ASSERT_OK(array->ValidateFull());
+    AssertArraysEqual(*ArrayFromJSON(type, R"(["hello", "world"])"), *array,
+                      /*verbose=*/true);
+
+    ASSERT_EQ(array->data()->buffers.size(), 3);
+    ASSERT_NE(array->data()->buffers[2], nullptr);
+    ASSERT_EQ(array->data()->buffers[2]->size(), 0);
+    cb.AssertNotCalled();
+    array.reset();
+    cb.AssertCalled();
+  }
 }
 
 TEST_F(TestArrayImport, StringWithOffset) {

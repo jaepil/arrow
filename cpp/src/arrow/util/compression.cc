@@ -20,12 +20,13 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/util/compression_internal.h"
 #include "arrow/util/config.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 namespace util {
@@ -200,11 +201,16 @@ Result<std::unique_ptr<Codec>> Codec::Create(Compression::type codec_type,
       codec = internal::MakeLz4HadoopRawCodec();
 #endif
       break;
-    case Compression::ZSTD:
+    case Compression::ZSTD: {
 #ifdef ARROW_WITH_ZSTD
-      codec = internal::MakeZSTDCodec(compression_level);
+      auto opt = dynamic_cast<const ZstdCodecOptions*>(&codec_options);
+      codec = internal::MakeZSTDCodec(
+          compression_level,
+          opt ? opt->compression_context_params : std::vector<std::pair<int, int>>{},
+          opt ? opt->decompression_context_params : std::vector<std::pair<int, int>>{});
 #endif
       break;
+    }
     case Compression::BZ2:
 #ifdef ARROW_WITH_BZ2
       codec = internal::MakeBZ2Codec(compression_level);

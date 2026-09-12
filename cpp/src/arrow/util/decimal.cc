@@ -35,7 +35,7 @@
 #include "arrow/util/formatting.h"
 #include "arrow/util/int128_internal.h"
 #include "arrow/util/int_util_overflow.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/value_parsing.h"
 
@@ -44,6 +44,29 @@ namespace arrow {
 using internal::SafeLeftShift;
 using internal::SafeSignedAdd;
 using internal::uint128_t;
+
+namespace internal {
+
+Status ToArrowStatus(DecimalStatus dstatus) {
+  switch (dstatus) {
+    case DecimalStatus::kSuccess:
+      return Status::OK();
+
+    case DecimalStatus::kDivideByZero:
+      return Status::Invalid("Division by 0 in Decimal");
+
+    case DecimalStatus::kOverflow:
+      return Status::Invalid("Overflow occurred during Decimal operation");
+
+    case DecimalStatus::kRescaleDataLoss:
+      return Status::Invalid("Rescaling Decimal value would cause data loss");
+
+    default:
+      return Status::UnknownError("Unknown Decimal error");
+  }
+}
+
+}  // namespace internal
 
 namespace {
 
@@ -587,7 +610,8 @@ static void AppendLittleEndianArrayToString(const std::array<uint64_t, n>& array
       // *elem = dividend / 1e9;
       // remainder = dividend % 1e9.
       uint32_t hi = static_cast<uint32_t>(*elem >> 32);
-      uint32_t lo = static_cast<uint32_t>(*elem & bit_util::LeastSignificantBitMask(32));
+      uint32_t lo =
+          static_cast<uint32_t>(*elem & bit_util::LeastSignificantBitMask<uint64_t>(32));
       uint64_t dividend_hi = (static_cast<uint64_t>(remainder) << 32) | hi;
       uint64_t quotient_hi = dividend_hi / k1e9;
       remainder = static_cast<uint32_t>(dividend_hi % k1e9);
@@ -835,24 +859,6 @@ bool ParseDecimalComponents(const char* s, size_t size, DecimalComponents* out) 
   return pos == size;
 }
 
-inline Status ToArrowStatus(DecimalStatus dstatus, int num_bits) {
-  switch (dstatus) {
-    case DecimalStatus::kSuccess:
-      return Status::OK();
-
-    case DecimalStatus::kDivideByZero:
-      return Status::Invalid("Division by 0 in Decimal", num_bits);
-
-    case DecimalStatus::kOverflow:
-      return Status::Invalid("Overflow occurred during Decimal", num_bits, " operation.");
-
-    case DecimalStatus::kRescaleDataLoss:
-      return Status::Invalid("Rescaling Decimal", num_bits,
-                             " value would cause data loss");
-  }
-  return Status::OK();
-}
-
 template <typename Decimal>
 Status DecimalFromString(const char* type_name, std::string_view s, Decimal* out,
                          int32_t* precision, int32_t* scale) {
@@ -875,9 +881,13 @@ Status DecimalFromString(const char* type_name, std::string_view s, Decimal* out
 
   int32_t parsed_scale = 0;
   if (dec.has_exponent) {
-    auto adjusted_exponent = dec.exponent;
-    parsed_scale =
-        -adjusted_exponent + static_cast<int32_t>(dec.fractional_digits.size());
+    // parsed_scale = -exponent + fractional_digits, computed with overflow
+    // detection: an exponent of INT32_MIN ("0E-2147483648") makes the negation,
+    // and a near-INT32_MIN exponent the addition, signed-overflow UB otherwise.
+    if (internal::SubtractWithOverflow(static_cast<int32_t>(dec.fractional_digits.size()),
+                                       dec.exponent, &parsed_scale)) {
+      return Status::Invalid("The string '", s, "' cannot be represented as ", type_name);
+    }
   } else {
     parsed_scale = static_cast<int32_t>(dec.fractional_digits.size());
   }
@@ -939,9 +949,13 @@ Status SimpleDecimalFromString(const char* type_name, std::string_view s,
 
   int32_t parsed_scale = 0;
   if (dec.has_exponent) {
-    auto adjusted_exponent = dec.exponent;
-    parsed_scale =
-        -adjusted_exponent + static_cast<int32_t>(dec.fractional_digits.size());
+    // parsed_scale = -exponent + fractional_digits, computed with overflow
+    // detection: an exponent of INT32_MIN ("0E-2147483648") makes the negation,
+    // and a near-INT32_MIN exponent the addition, signed-overflow UB otherwise.
+    if (internal::SubtractWithOverflow(static_cast<int32_t>(dec.fractional_digits.size()),
+                                       dec.exponent, &parsed_scale)) {
+      return Status::Invalid("The string '", s, "' cannot be represented as ", type_name);
+    }
   } else {
     parsed_scale = static_cast<int32_t>(dec.fractional_digits.size());
   }
@@ -1105,11 +1119,7 @@ Result<Decimal32> Decimal32::FromBigEndian(const uint8_t* bytes, int32_t length)
   return Decimal32(value);
 }
 
-Status Decimal32::ToArrowStatus(DecimalStatus dstatus) const {
-  return arrow::ToArrowStatus(dstatus, 32);
-}
-
-std::ostream& operator<<(std::ostream& os, const Decimal32& decimal) {
+ARROW_EXPORT std::ostream& operator<<(std::ostream& os, const Decimal32& decimal) {
   os << decimal.ToIntegerString();
   return os;
 }
@@ -1132,11 +1142,7 @@ Result<Decimal64> Decimal64::FromBigEndian(const uint8_t* bytes, int32_t length)
   return Decimal64(value);
 }
 
-Status Decimal64::ToArrowStatus(DecimalStatus dstatus) const {
-  return arrow::ToArrowStatus(dstatus, 64);
-}
-
-std::ostream& operator<<(std::ostream& os, const Decimal64& decimal) {
+ARROW_EXPORT std::ostream& operator<<(std::ostream& os, const Decimal64& decimal) {
   os << decimal.ToIntegerString();
   return os;
 }
@@ -1194,11 +1200,7 @@ Result<Decimal128> Decimal128::FromBigEndian(const uint8_t* bytes, int32_t lengt
   return Decimal128(high, static_cast<uint64_t>(low));
 }
 
-Status Decimal128::ToArrowStatus(DecimalStatus dstatus) const {
-  return arrow::ToArrowStatus(dstatus, 128);
-}
-
-std::ostream& operator<<(std::ostream& os, const Decimal128& decimal) {
+ARROW_EXPORT std::ostream& operator<<(std::ostream& os, const Decimal128& decimal) {
   os << decimal.ToIntegerString();
   return os;
 }
@@ -1300,10 +1302,6 @@ Result<Decimal256> Decimal256::FromBigEndian(const uint8_t* bytes, int32_t lengt
   }
 
   return Decimal256(bit_util::little_endian::ToNative(little_endian_array));
-}
-
-Status Decimal256::ToArrowStatus(DecimalStatus dstatus) const {
-  return arrow::ToArrowStatus(dstatus, 256);
 }
 
 namespace {
@@ -1451,7 +1449,7 @@ double Decimal256::ToDouble(int32_t scale) const {
   return Decimal256RealConversion::ToReal<double>(*this, scale);
 }
 
-std::ostream& operator<<(std::ostream& os, const Decimal256& decimal) {
+ARROW_EXPORT std::ostream& operator<<(std::ostream& os, const Decimal256& decimal) {
   os << decimal.ToIntegerString();
   return os;
 }

@@ -31,6 +31,7 @@
 #include "arrow/chunked_array.h"
 #include "arrow/extension_type.h"
 #include "arrow/status.h"
+#include "arrow/testing/builder.h"
 #include "arrow/testing/extension_type.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/testing/random.h"
@@ -46,7 +47,7 @@
 #include "arrow/compute/cast.h"
 #include "arrow/compute/kernel.h"
 #include "arrow/compute/kernels/codegen_internal.h"
-#include "arrow/compute/kernels/test_util.h"
+#include "arrow/compute/kernels/test_util_internal.h"
 
 namespace arrow {
 
@@ -56,16 +57,7 @@ using internal::checked_pointer_cast;
 namespace compute {
 
 static std::shared_ptr<Array> InvalidUtf8(std::shared_ptr<DataType> type) {
-  return ArrayFromJSON(type,
-                       "["
-                       R"(
-                       "Hi",
-                       "olá mundo",
-                       "你好世界",
-                       "",
-                       )"
-                       "\"\xa0\xa1\""
-                       "]");
+  return BinaryArrayFromStrings(type, {"Hi", "olá mundo", "你好世界", "", "\xa0\xa1"});
 }
 
 static std::shared_ptr<Array> FixedSizeInvalidUtf8(std::shared_ptr<DataType> type) {
@@ -73,16 +65,7 @@ static std::shared_ptr<Array> FixedSizeInvalidUtf8(std::shared_ptr<DataType> typ
     // Assume a particular width for testing
     EXPECT_EQ(3, checked_cast<const FixedSizeBinaryType&>(*type).byte_width());
   }
-  return ArrayFromJSON(type,
-                       "["
-                       R"(
-                       "Hi!",
-                       "lá",
-                       "你",
-                       "   ",
-                       )"
-                       "\"\xa0\xa1\xa2\""
-                       "]");
+  return BinaryArrayFromStrings(type, {"Hi!", "lá", "你", "   ", "\xa0\xa1\xa2"});
 }
 
 static std::vector<std::shared_ptr<DataType>> kNumericTypes = {
@@ -447,6 +430,159 @@ TEST(Cast, IntToFloating) {
                  CastOptions::Safe(float64()));
 }
 
+TEST(Cast, Decimal32ToInt) {
+  auto options = CastOptions::Safe(int32());
+
+  for (bool allow_int_overflow : {false, true}) {
+    for (bool allow_decimal_truncate : {false, true}) {
+      options.allow_int_overflow = allow_int_overflow;
+      options.allow_decimal_truncate = allow_decimal_truncate;
+
+      auto no_overflow_no_truncation = ArrayFromJSON(decimal32(9, 5), R"([
+          "02.00000",
+         "-11.00000",
+          "22.00000",
+        "-121.00000",
+        null])");
+      CheckCast(no_overflow_no_truncation,
+                ArrayFromJSON(int32(), "[2, -11, 22, -121, null]"), options);
+    }
+  }
+
+  for (bool allow_int_overflow : {false, true}) {
+    options.allow_int_overflow = allow_int_overflow;
+    auto truncation_but_no_overflow = ArrayFromJSON(decimal32(9, 5), R"([
+          "02.10000",
+         "-11.00450",
+          "22.00045",
+        "-121.12100",
+        null])");
+
+    options.allow_decimal_truncate = true;
+    CheckCast(truncation_but_no_overflow,
+              ArrayFromJSON(int32(), "[2, -11, 22, -121, null]"), options);
+
+    options.allow_decimal_truncate = false;
+    CheckCastFails(truncation_but_no_overflow, options);
+  }
+
+  for (bool allow_int_overflow : {false, true}) {
+    for (bool allow_decimal_truncate : {false, true}) {
+      options.allow_int_overflow = allow_int_overflow;
+      options.allow_decimal_truncate = allow_decimal_truncate;
+
+      auto overflow_and_truncation = ArrayFromJSON(decimal32(9, 5), R"([
+        "1234.00453",
+        "9999.00344",
+        null])");
+
+      if (options.allow_decimal_truncate) {
+        CheckCast(overflow_and_truncation, ArrayFromJSON(int32(), "[1234, 9999, null]"),
+                  options);
+      } else {
+        CheckCastFails(overflow_and_truncation, options);
+      }
+    }
+  }
+
+  Decimal32Builder builder(decimal32(9, -3));
+  for (auto d : {Decimal32("12345000."), Decimal32("-12000000.")}) {
+    ASSERT_OK_AND_ASSIGN(d, d.Rescale(0, -3));
+    ASSERT_OK(builder.Append(d));
+  }
+  ASSERT_OK_AND_ASSIGN(auto negative_scale, builder.Finish());
+  options.allow_int_overflow = true;
+  options.allow_decimal_truncate = true;
+  CheckCast(negative_scale, ArrayFromJSON(int32(), "[12345000, -12000000]"), options);
+}
+
+TEST(Cast, Decimal64ToInt) {
+  auto options = CastOptions::Safe(int64());
+
+  for (bool allow_int_overflow : {false, true}) {
+    for (bool allow_decimal_truncate : {false, true}) {
+      options.allow_int_overflow = allow_int_overflow;
+      options.allow_decimal_truncate = allow_decimal_truncate;
+
+      auto no_overflow_no_truncation = ArrayFromJSON(decimal64(18, 10), R"([
+          "02.0000000000",
+         "-11.0000000000",
+          "22.0000000000",
+        "-121.0000000000",
+        null])");
+      CheckCast(no_overflow_no_truncation,
+                ArrayFromJSON(int64(), "[2, -11, 22, -121, null]"), options);
+    }
+  }
+
+  for (bool allow_int_overflow : {false, true}) {
+    options.allow_int_overflow = allow_int_overflow;
+    auto truncation_but_no_overflow = ArrayFromJSON(decimal64(18, 10), R"([
+          "02.1000000000",
+         "-11.0000004500",
+          "22.0000004500",
+        "-121.1210000000",
+        null])");
+
+    options.allow_decimal_truncate = true;
+    CheckCast(truncation_but_no_overflow,
+              ArrayFromJSON(int32(), "[2, -11, 22, -121, null]"), options);
+
+    options.allow_decimal_truncate = false;
+    CheckCastFails(truncation_but_no_overflow, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto overflow_no_truncation = ArrayFromJSON(decimal64(18, 5), R"([
+        "1234567890123.00000",
+        "9999999999999.00000",
+        null])");
+
+    options.allow_int_overflow = true;
+    CheckCast(overflow_no_truncation,
+              ArrayFromJSON(int64(), "[1234567890123, 9999999999999, null]"), options);
+
+    options.to_type = int32();
+    options.allow_int_overflow = false;
+    CheckCastFails(overflow_no_truncation, options);
+  }
+
+  for (bool allow_int_overflow : {false, true}) {
+    for (bool allow_decimal_truncate : {false, true}) {
+      options.allow_int_overflow = allow_int_overflow;
+      options.allow_decimal_truncate = allow_decimal_truncate;
+      options.to_type = int32();
+
+      auto overflow_and_truncation = ArrayFromJSON(decimal64(18, 5), R"([
+        "1234567890123.45345",
+        "9999999999999.00344",
+        null])");
+
+      if (options.allow_int_overflow && options.allow_decimal_truncate) {
+        CheckCast(overflow_and_truncation,
+                  ArrayFromJSON(int32(),
+                                // 1234567890123 % 2**32, 9999999999999 % 2**32
+                                "[1912276171, 1316134911, null]"),
+                  options);
+      } else {
+        CheckCastFails(overflow_and_truncation, options);
+      }
+    }
+  }
+
+  Decimal64Builder builder(decimal64(18, -4));
+  for (auto d : {Decimal64("1234567890000."), Decimal64("-120000.")}) {
+    ASSERT_OK_AND_ASSIGN(d, d.Rescale(0, -4));
+    ASSERT_OK(builder.Append(d));
+  }
+  ASSERT_OK_AND_ASSIGN(auto negative_scale, builder.Finish());
+  options.allow_int_overflow = true;
+  options.allow_decimal_truncate = true;
+  CheckCast(negative_scale, ArrayFromJSON(int64(), "[1234567890000, -120000]"), options);
+}
+
 TEST(Cast, Decimal128ToInt) {
   auto options = CastOptions::Safe(int64());
 
@@ -629,11 +765,14 @@ TEST(Cast, Decimal256ToInt) {
 }
 
 TEST(Cast, IntegerToDecimal) {
-  for (auto decimal_type : {decimal128(22, 2), decimal256(22, 2)}) {
+  for (auto decimal_type :
+       {decimal32(9, 2), decimal64(18, 2), decimal128(22, 2), decimal256(22, 2)}) {
     for (auto integer_type : kIntegerTypes) {
-      CheckCast(
-          ArrayFromJSON(integer_type, "[0, 7, null, 100, 99]"),
-          ArrayFromJSON(decimal_type, R"(["0.00", "7.00", null, "100.00", "99.00"])"));
+      if (decimal_type->bit_width() > integer_type->bit_width()) {
+        CheckCast(
+            ArrayFromJSON(integer_type, "[0, 7, null, 100, 99]"),
+            ArrayFromJSON(decimal_type, R"(["0.00", "7.00", null, "100.00", "99.00"])"));
+      }
     }
   }
 
@@ -652,11 +791,177 @@ TEST(Cast, IntegerToDecimal) {
   {
     CastOptions options;
 
+    options.to_type = decimal32(9, 3);
+    CheckCastFails(ArrayFromJSON(int32(), "[0]"), options);
+
+    options.to_type = decimal64(18, 3);
+    CheckCastFails(ArrayFromJSON(int64(), "[0]"), options);
+
     options.to_type = decimal128(5, 3);
     CheckCastFails(ArrayFromJSON(int8(), "[0]"), options);
 
     options.to_type = decimal256(76, 67);
     CheckCastFails(ArrayFromJSON(int32(), "[0]"), options);
+  }
+}
+
+TEST(Cast, Decimal32ToDecimal32) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal32(9, 5), R"([
+          "02.00000",
+          "30.00000",
+          "22.00000",
+        "-121.00000",
+        null])");
+    auto expected = ArrayFromJSON(decimal32(9, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+    CheckCast(expected, no_truncation, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_5_2 = ArrayFromJSON(decimal32(5, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal32(4, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_5_2, d_4_2, options);
+    CheckCast(d_4_2, d_5_2, options);
+  }
+
+  auto d_9_5 = ArrayFromJSON(decimal32(9, 5), R"([
+      "-02.12345",
+       "30.12345",
+      null])");
+
+  auto d_6_0 = ArrayFromJSON(decimal32(6, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d_9_5_roundtripped = ArrayFromJSON(decimal32(9, 5), R"([
+      "-02.00000",
+       "30.00000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d_9_5, d_6_0, options);
+  CheckCast(d_6_0, d_9_5_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d_6_0->type();
+  CheckCastFails(d_9_5, options);
+  CheckCast(d_6_0, d_9_5_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d_4_2 = ArrayFromJSON(decimal32(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal32(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal32(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal32(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal64ToDecimal64) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal64(18, 10), R"([
+          "02.0000000000",
+          "30.0000000000",
+          "22.0000000000",
+        "-121.0000000000",
+        null])");
+    auto expected = ArrayFromJSON(decimal64(9, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+    CheckCast(expected, no_truncation, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_5_2 = ArrayFromJSON(decimal64(5, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal64(4, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_5_2, d_4_2, options);
+    CheckCast(d_4_2, d_5_2, options);
+  }
+
+  auto d_18_10 = ArrayFromJSON(decimal64(18, 10), R"([
+      "-02.1234567890",
+       "30.1234567890",
+      null])");
+
+  auto d_12_0 = ArrayFromJSON(decimal64(12, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d_18_10_roundtripped = ArrayFromJSON(decimal64(18, 10), R"([
+      "-02.0000000000",
+       "30.0000000000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d_18_10, d_12_0, options);
+  CheckCast(d_12_0, d_18_10_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d_12_0->type();
+  CheckCastFails(d_18_10, options);
+  CheckCast(d_12_0, d_18_10_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d_4_2 = ArrayFromJSON(decimal64(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal64(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal64(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal64(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d_4_2, options);
   }
 }
 
@@ -820,6 +1125,690 @@ TEST(Cast, Decimal256ToDecimal256) {
   }
 }
 
+TEST(Cast, Decimal32ToDecimal64) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal32(9, 5), R"([
+          "02.00000",
+          "30.00000",
+          "22.00000",
+        "-121.00000",
+        null])");
+    auto expected = ArrayFromJSON(decimal64(16, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_5_2 = ArrayFromJSON(decimal32(5, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal64(4, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_16_2 = ArrayFromJSON(decimal64(16, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_5_2, d_4_2, options);
+    CheckCast(d_5_2, d_16_2, options);
+  }
+
+  auto d32_7_5 = ArrayFromJSON(decimal32(7, 5), R"([
+      "-02.12345",
+       "30.12345",
+      null])");
+
+  auto d32_9_0 = ArrayFromJSON(decimal32(9, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d64_14_0 = ArrayFromJSON(decimal64(14, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d64_18_10_roundtripped = ArrayFromJSON(decimal64(18, 10), R"([
+      "-02.0000000000",
+       "30.0000000000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d32_7_5, d64_14_0, options);
+  CheckCast(d32_9_0, d64_18_10_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d64_14_0->type();
+  CheckCastFails(d32_7_5, options);
+  CheckCast(d32_9_0, d64_18_10_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d32_4_2 = ArrayFromJSON(decimal32(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal64(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal64(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal64(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d32_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d32_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal32ToDecimal128) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal32(9, 5), R"([
+          "02.00000",
+          "30.00000",
+          "22.00000",
+        "-121.00000",
+        null])");
+    auto expected = ArrayFromJSON(decimal128(16, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_5_2 = ArrayFromJSON(decimal32(5, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal128(4, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_16_2 = ArrayFromJSON(decimal128(16, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_5_2, d_4_2, options);
+    CheckCast(d_5_2, d_16_2, options);
+  }
+
+  auto d32_7_5 = ArrayFromJSON(decimal32(7, 5), R"([
+      "-02.12345",
+       "30.12345",
+      null])");
+
+  auto d32_9_0 = ArrayFromJSON(decimal32(9, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d128_14_0 = ArrayFromJSON(decimal128(14, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d128_38_10_roundtripped = ArrayFromJSON(decimal128(38, 10), R"([
+      "-02.0000000000",
+       "30.0000000000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d32_7_5, d128_14_0, options);
+  CheckCast(d32_9_0, d128_38_10_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d128_14_0->type();
+  CheckCastFails(d32_7_5, options);
+  CheckCast(d32_9_0, d128_38_10_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d32_4_2 = ArrayFromJSON(decimal32(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal128(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal128(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal128(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d32_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d32_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal32ToDecimal256) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal32(9, 5), R"([
+          "02.00000",
+          "30.00000",
+          "22.00000",
+        "-121.00000",
+        null])");
+    auto expected = ArrayFromJSON(decimal256(16, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_5_2 = ArrayFromJSON(decimal32(5, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal256(4, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_16_2 = ArrayFromJSON(decimal256(16, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_5_2, d_4_2, options);
+    CheckCast(d_5_2, d_16_2, options);
+  }
+
+  auto d32_7_5 = ArrayFromJSON(decimal32(7, 5), R"([
+      "-02.12345",
+       "30.12345",
+      null])");
+
+  auto d32_9_0 = ArrayFromJSON(decimal32(9, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d256_14_0 = ArrayFromJSON(decimal256(14, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d256_76_10_roundtripped = ArrayFromJSON(decimal256(76, 10), R"([
+      "-02.0000000000",
+       "30.0000000000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d32_7_5, d256_14_0, options);
+  CheckCast(d32_9_0, d256_76_10_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d256_14_0->type();
+  CheckCastFails(d32_7_5, options);
+  CheckCast(d32_9_0, d256_76_10_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d32_4_2 = ArrayFromJSON(decimal32(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal256(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal256(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal256(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d32_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d32_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal64ToDecimal32) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal64(18, 5), R"([
+          "02.00000",
+          "30.00000",
+          "22.00000",
+        "-121.00000",
+        null])");
+    auto expected = ArrayFromJSON(decimal32(9, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_12_2 = ArrayFromJSON(decimal64(12, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal32(4, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_12_2, d_4_2, options);
+  }
+
+  auto d64_15_10 = ArrayFromJSON(decimal64(15, 5), R"([
+      "-02.12345",
+       "30.12345",
+      null])");
+
+  auto d64_12_0 = ArrayFromJSON(decimal64(12, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d32_6_0 = ArrayFromJSON(decimal32(6, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d32_9_5_roundtripped = ArrayFromJSON(decimal32(9, 5), R"([
+      "-02.00000",
+       "30.00000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d64_15_10, d32_6_0, options);
+  CheckCast(d64_12_0, d32_9_5_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d32_6_0->type();
+  CheckCastFails(d64_15_10, options);
+  CheckCast(d64_12_0, d32_9_5_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d64_4_2 = ArrayFromJSON(decimal64(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal32(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal32(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal32(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d64_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d64_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal64ToDecimal128) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal64(18, 10), R"([
+          "02.0000000000",
+          "30.0000000000",
+          "22.0000000000",
+        "-121.0000000000",
+        null])");
+    auto expected = ArrayFromJSON(decimal128(28, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_5_2 = ArrayFromJSON(decimal64(5, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal128(4, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_16_2 = ArrayFromJSON(decimal128(16, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_5_2, d_4_2, options);
+    CheckCast(d_5_2, d_16_2, options);
+  }
+
+  auto d64_16_10 = ArrayFromJSON(decimal64(16, 10), R"([
+      "-02.1234567890",
+       "30.1234567890",
+      null])");
+
+  auto d64_18_0 = ArrayFromJSON(decimal64(18, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d128_14_0 = ArrayFromJSON(decimal128(14, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d128_38_10_roundtripped = ArrayFromJSON(decimal128(38, 10), R"([
+      "-02.0000000000",
+       "30.0000000000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d64_16_10, d128_14_0, options);
+  CheckCast(d64_18_0, d128_38_10_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d128_14_0->type();
+  CheckCastFails(d64_16_10, options);
+  CheckCast(d64_18_0, d128_38_10_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d64_4_2 = ArrayFromJSON(decimal64(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal128(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal128(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal128(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d64_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d64_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal64ToDecimal256) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal64(18, 10), R"([
+          "02.0000000000",
+          "30.0000000000",
+          "22.0000000000",
+        "-121.0000000000",
+        null])");
+    auto expected = ArrayFromJSON(decimal256(16, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_5_2 = ArrayFromJSON(decimal64(5, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal256(4, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_16_2 = ArrayFromJSON(decimal256(16, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_5_2, d_4_2, options);
+    CheckCast(d_5_2, d_16_2, options);
+  }
+
+  auto d64_16_10 = ArrayFromJSON(decimal64(16, 10), R"([
+      "-02.1234567890",
+       "30.1234567890",
+      null])");
+
+  auto d64_18_0 = ArrayFromJSON(decimal64(18, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d256_14_0 = ArrayFromJSON(decimal256(14, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d256_76_10_roundtripped = ArrayFromJSON(decimal256(76, 10), R"([
+      "-02.0000000000",
+       "30.0000000000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d64_16_10, d256_14_0, options);
+  CheckCast(d64_18_0, d256_76_10_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d256_14_0->type();
+  CheckCastFails(d64_16_10, options);
+  CheckCast(d64_18_0, d256_76_10_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d64_4_2 = ArrayFromJSON(decimal64(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal256(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal256(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal256(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d64_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d64_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal128ToDecimal32) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal128(26, 5), R"([
+          "02.00000",
+          "30.00000",
+          "22.00000",
+        "-121.00000",
+        null])");
+    auto expected = ArrayFromJSON(decimal32(9, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_28_2 = ArrayFromJSON(decimal128(28, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal32(4, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_28_2, d_4_2, options);
+  }
+
+  auto d128_28_5 = ArrayFromJSON(decimal128(28, 5), R"([
+      "-02.12345",
+       "30.12345",
+      null])");
+
+  auto d128_22_0 = ArrayFromJSON(decimal128(22, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d32_7_0 = ArrayFromJSON(decimal32(7, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d32_9_5_roundtripped = ArrayFromJSON(decimal32(9, 5), R"([
+      "-02.00000",
+       "30.00000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d128_28_5, d32_7_0, options);
+  CheckCast(d128_22_0, d32_9_5_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d32_7_0->type();
+  CheckCastFails(d128_28_5, options);
+  CheckCast(d128_22_0, d32_9_5_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d128_4_2 = ArrayFromJSON(decimal128(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal32(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal32(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal32(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d128_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d128_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal128ToDecimal64) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal128(26, 10), R"([
+          "02.0000000000",
+          "30.0000000000",
+          "22.0000000000",
+        "-121.0000000000",
+        null])");
+    auto expected = ArrayFromJSON(decimal64(15, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_28_2 = ArrayFromJSON(decimal128(28, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal64(4, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_28_2, d_4_2, options);
+  }
+
+  auto d128_28_10 = ArrayFromJSON(decimal128(28, 10), R"([
+      "-02.1234567890",
+       "30.1234567890",
+      null])");
+
+  auto d128_22_0 = ArrayFromJSON(decimal128(22, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d64_12_0 = ArrayFromJSON(decimal64(12, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d64_18_10_roundtripped = ArrayFromJSON(decimal64(18, 10), R"([
+      "-02.0000000000",
+       "30.0000000000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d128_28_10, d64_12_0, options);
+  CheckCast(d128_22_0, d64_18_10_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d64_12_0->type();
+  CheckCastFails(d128_28_10, options);
+  CheckCast(d128_22_0, d64_18_10_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d128_4_2 = ArrayFromJSON(decimal128(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal64(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal64(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal64(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d128_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d128_4_2, options);
+  }
+}
+
 TEST(Cast, Decimal128ToDecimal256) {
   CastOptions options;
 
@@ -904,6 +1893,172 @@ TEST(Cast, Decimal128ToDecimal256) {
     options.allow_decimal_truncate = false;
     options.to_type = expected->type();
     CheckCastFails(d128_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal256ToDecimal32) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal256(42, 5), R"([
+          "02.00000",
+          "30.00000",
+          "22.00000",
+        "-121.00000",
+        null])");
+    auto expected = ArrayFromJSON(decimal32(9, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_28_2 = ArrayFromJSON(decimal256(42, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal32(4, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_28_2, d_4_2, options);
+  }
+
+  auto d256_52_5 = ArrayFromJSON(decimal256(52, 5), R"([
+      "-02.12345",
+       "30.12345",
+      null])");
+
+  auto d256_42_0 = ArrayFromJSON(decimal256(42, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d32_7_0 = ArrayFromJSON(decimal32(7, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d32_9_5_roundtripped = ArrayFromJSON(decimal32(9, 5), R"([
+      "-02.00000",
+       "30.00000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d256_52_5, d32_7_0, options);
+  CheckCast(d256_42_0, d32_9_5_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d32_7_0->type();
+  CheckCastFails(d256_52_5, options);
+  CheckCast(d256_42_0, d32_9_5_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d256_4_2 = ArrayFromJSON(decimal256(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal32(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal32(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal32(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d256_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d256_4_2, options);
+  }
+}
+
+TEST(Cast, Decimal256ToDecimal64) {
+  CastOptions options;
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    auto no_truncation = ArrayFromJSON(decimal256(42, 10), R"([
+          "02.0000000000",
+          "30.0000000000",
+          "22.0000000000",
+        "-121.0000000000",
+        null])");
+    auto expected = ArrayFromJSON(decimal64(15, 0), R"([
+          "02.",
+          "30.",
+          "22.",
+        "-121.",
+        null])");
+
+    CheckCast(no_truncation, expected, options);
+  }
+
+  for (bool allow_decimal_truncate : {false, true}) {
+    options.allow_decimal_truncate = allow_decimal_truncate;
+
+    // Same scale, different precision
+    auto d_42_2 = ArrayFromJSON(decimal256(42, 2), R"([
+          "12.34",
+           "0.56"])");
+    auto d_4_2 = ArrayFromJSON(decimal64(4, 2), R"([
+          "12.34",
+           "0.56"])");
+
+    CheckCast(d_42_2, d_4_2, options);
+  }
+
+  auto d256_52_10 = ArrayFromJSON(decimal256(52, 10), R"([
+      "-02.1234567890",
+       "30.1234567890",
+      null])");
+
+  auto d256_42_0 = ArrayFromJSON(decimal256(42, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d64_12_0 = ArrayFromJSON(decimal64(12, 0), R"([
+      "-02.",
+       "30.",
+      null])");
+
+  auto d64_18_10_roundtripped = ArrayFromJSON(decimal64(18, 10), R"([
+      "-02.0000000000",
+       "30.0000000000",
+      null])");
+
+  // Rescale which leads to truncation
+  options.allow_decimal_truncate = true;
+  CheckCast(d256_52_10, d64_12_0, options);
+  CheckCast(d256_42_0, d64_18_10_roundtripped, options);
+
+  options.allow_decimal_truncate = false;
+  options.to_type = d64_12_0->type();
+  CheckCastFails(d256_52_10, options);
+  CheckCast(d256_42_0, d64_18_10_roundtripped, options);
+
+  // Precision loss without rescale leads to truncation
+  auto d256_4_2 = ArrayFromJSON(decimal256(4, 2), R"(["12.34"])");
+  for (auto expected : {
+           ArrayFromJSON(decimal64(3, 2), R"(["12.34"])"),
+           ArrayFromJSON(decimal64(4, 3), R"(["12.340"])"),
+           ArrayFromJSON(decimal64(2, 1), R"(["12.3"])"),
+       }) {
+    options.allow_decimal_truncate = true;
+    ASSERT_OK_AND_ASSIGN(auto invalid, Cast(d256_4_2, expected->type(), options));
+    ASSERT_RAISES(Invalid, invalid.make_array()->ValidateFull());
+
+    options.allow_decimal_truncate = false;
+    options.to_type = expected->type();
+    CheckCastFails(d256_4_2, options);
   }
 }
 
@@ -992,7 +2147,8 @@ TEST(Cast, Decimal256ToDecimal128) {
 
 TEST(Cast, FloatingToDecimal) {
   for (auto float_type : {float32(), float64()}) {
-    for (auto decimal_type : {decimal128(5, 2), decimal256(5, 2)}) {
+    for (auto decimal_type :
+         {decimal32(5, 2), decimal64(5, 2), decimal128(5, 2), decimal256(5, 2)}) {
       CheckCast(
           ArrayFromJSON(float_type, "[0.0, null, 123.45, 123.456, 999.994]"),
           ArrayFromJSON(decimal_type, R"(["0.00", null, "123.45", "123.46", "999.99"])"));
@@ -1036,7 +2192,8 @@ TEST(Cast, FloatingToDecimal) {
 
 TEST(Cast, DecimalToFloating) {
   for (auto float_type : {float32(), float64()}) {
-    for (auto decimal_type : {decimal128(5, 2), decimal256(5, 2)}) {
+    for (auto decimal_type :
+         {decimal32(5, 2), decimal64(5, 2), decimal128(5, 2), decimal256(5, 2)}) {
       CheckCast(ArrayFromJSON(decimal_type, R"(["0.00", null, "123.45", "999.99"])"),
                 ArrayFromJSON(float_type, "[0.0, null, 123.45, 999.99]"));
     }
@@ -1048,7 +2205,8 @@ TEST(Cast, DecimalToFloating) {
 
 TEST(Cast, DecimalToString) {
   for (auto string_type : {utf8(), utf8_view(), large_utf8()}) {
-    for (auto decimal_type : {decimal128(5, 2), decimal256(5, 2)}) {
+    for (auto decimal_type :
+         {decimal32(5, 2), decimal64(5, 2), decimal128(5, 2), decimal256(5, 2)}) {
       CheckCast(ArrayFromJSON(decimal_type, R"(["0.00", null, "123.45", "999.99"])"),
                 ArrayFromJSON(string_type, R"(["0.00", null, "123.45", "999.99"])"));
     }
@@ -1183,15 +2341,7 @@ constexpr char kTimestampSecondsJson[] =
 constexpr char kTimestampExtremeJson[] =
     R"(["1677-09-20T00:00:59.123456", "2262-04-13T23:23:23.999999"])";
 
-class CastTimezone : public ::testing::Test {
- protected:
-  void SetUp() override {
-#ifdef _WIN32
-    // Initialize timezone database on Windows
-    ASSERT_OK(InitTestTimezoneDatabase());
-#endif
-  }
-};
+class CastTimezone : public ::testing::Test {};
 
 TEST(Cast, TimestampToDate) {
   // See scalar_temporal_test.cc
@@ -1960,7 +3110,8 @@ TEST(Cast, StringToFloating) {
 
 TEST(Cast, StringToDecimal) {
   for (auto string_type : {utf8(), large_utf8()}) {
-    for (auto decimal_type : {decimal128(5, 2), decimal256(5, 2)}) {
+    for (auto decimal_type :
+         {decimal32(5, 2), decimal64(5, 2), decimal128(5, 2), decimal256(5, 2)}) {
       auto strings =
           ArrayFromJSON(string_type, R"(["0.01", null, "127.32", "200.43", "0.54"])");
       auto decimals =
@@ -2134,9 +3285,12 @@ TEST(Cast, BinaryToString) {
     // N.B. null buffer is not always the same if input sliced
     AssertBufferSame(*invalid_utf8, *strings, 0);
 
-    // ARROW-16757: we no longer zero copy, but the contents are equal
-    ASSERT_NE(invalid_utf8->data()->buffers[1].get(), strings->data()->buffers[2].get());
-    if (!is_binary_view_like(*string_type)) {
+    if (is_binary_view_like(*string_type)) {
+      ASSERT_EQ(strings->data()->buffers.size(), 2);
+    } else {
+      // ARROW-16757: we no longer zero copy, but the contents are equal
+      ASSERT_NE(invalid_utf8->data()->buffers[1].get(),
+                strings->data()->buffers[2].get());
       ASSERT_TRUE(invalid_utf8->data()->buffers[1]->Equals(*strings->data()->buffers[2]));
     }
   }
@@ -2176,15 +3330,87 @@ TEST(Cast, BinaryOrStringToBinary) {
     // N.B. null buffer is not always the same if input sliced
     AssertBufferSame(*invalid_utf8, *strings, 0);
 
-    // ARROW-16757: we no longer zero copy, but the contents are equal
-    ASSERT_NE(invalid_utf8->data()->buffers[1].get(), strings->data()->buffers[2].get());
-    if (!is_binary_view_like(*to_type)) {
+    if (is_binary_view_like(*to_type)) {
+      ASSERT_EQ(strings->data()->buffers.size(), 2);
+    } else {
+      // ARROW-16757: we no longer zero copy, but the contents are equal
+      ASSERT_NE(invalid_utf8->data()->buffers[1].get(),
+                strings->data()->buffers[2].get());
       ASSERT_TRUE(invalid_utf8->data()->buffers[1]->Equals(*strings->data()->buffers[2]));
     }
 
     // invalid utf-8 masked by a null bit is not an error
     CheckCast(MaskArrayWithNullsAt(invalid_utf8, {4}),
               MaskArrayWithNullsAt(FixedSizeInvalidUtf8(to_type), {4}));
+  }
+}
+
+TEST(Cast, BinaryOrStringToView) {
+  // GH-49740: when all values were inline, the cast left a null variadic
+  // buffer slot behind and exporting to the C data interface crashed.
+  const std::vector<std::pair<std::string, int64_t>> cases = {
+      // Empty inputs are handled before the cast kernel runs.
+      {"[]", 2},
+      {R"(["a", null, "e"])", 2},
+      {"[null, null]", 2},
+      {R"(["aaaaaaaaaaaaa", null, "eeeeeeeeeeeee"])", 3},
+      {R"(["a", null, "aaaaaaaaaaaaa"])", 3},
+  };
+
+  for (auto from_type : {binary(), large_binary(), utf8(), large_utf8()}) {
+    for (auto to_type : {binary_view(), utf8_view()}) {
+      for (const auto& [json, expected_num_buffers] : cases) {
+        auto input = ArrayFromJSON(from_type, json);
+        auto expected = ArrayFromJSON(to_type, json);
+
+        ASSERT_OK_AND_ASSIGN(auto casted, Cast(*input, to_type));
+        ValidateOutput(*casted);
+        AssertArraysEqual(*expected, *casted);
+
+        ASSERT_EQ(casted->data()->buffers.size(), expected_num_buffers)
+            << "from: " << from_type->ToString() << ", to: " << to_type->ToString()
+            << ", values: " << json;
+        if (expected_num_buffers == 3) {
+          ASSERT_NE(casted->data()->buffers[2], nullptr)
+              << "from: " << from_type->ToString() << ", to: " << to_type->ToString()
+              << ", values: " << json;
+        }
+      }
+    }
+  }
+}
+
+TEST(Cast, FixedSizeBinaryToView) {
+  // Fixed-size binary uses a separate cast kernel with the same GH-49740
+  // issue. Cover non-empty widths on both sides of the BinaryView inline limit.
+  const std::vector<std::tuple<std::shared_ptr<DataType>, std::string, int64_t>> cases = {
+      // Empty inputs are handled before the cast kernel runs.
+      {fixed_size_binary(1), "[]", 2},
+      {fixed_size_binary(13), "[]", 2},
+      {fixed_size_binary(1), R"(["a", null, "e"])", 2},
+      {fixed_size_binary(1), "[null, null]", 2},
+      {fixed_size_binary(12), R"(["aaaaaaaaaaaa", null])", 2},
+      {fixed_size_binary(13), R"(["aaaaaaaaaaaaa", null, "eeeeeeeeeeeee"])", 3},
+  };
+
+  for (const auto& [from_type, json, expected_num_buffers] : cases) {
+    for (auto to_type : {binary_view(), utf8_view()}) {
+      auto input = ArrayFromJSON(from_type, json);
+      auto expected = ArrayFromJSON(to_type, json);
+
+      ASSERT_OK_AND_ASSIGN(auto casted, Cast(*input, to_type));
+      ValidateOutput(*casted);
+      AssertArraysEqual(*expected, *casted);
+
+      ASSERT_EQ(casted->data()->buffers.size(), expected_num_buffers)
+          << "from: " << from_type->ToString() << ", to: " << to_type->ToString()
+          << ", values: " << json;
+      if (expected_num_buffers == 3) {
+        ASSERT_NE(casted->data()->buffers[2], nullptr)
+            << "from: " << from_type->ToString() << ", to: " << to_type->ToString()
+            << ", values: " << json;
+      }
+    }
   }
 }
 
@@ -2220,6 +3446,46 @@ TEST(Cast, StringToString) {
       CheckCast(ArrayFromJSON(from_type, long_input), ArrayFromJSON(to_type, long_input));
       CheckCast(ArrayFromJSON(from_type, combine_input),
                 ArrayFromJSON(to_type, combine_input));
+    }
+  }
+}
+
+TEST(Cast, StringToStringWithOffset) {
+  // GH-43660: Check casting String Arrays with nonzero offset
+  std::vector<int64_t> offsets = {3, 8, 10, 12};
+  std::vector<int64_t> lengths = {5, 2, 1, 0};
+
+  for (auto from_type : {utf8(), large_utf8()}) {
+    for (auto to_type : {utf8(), large_utf8()}) {
+      for (size_t i = 0; i < offsets.size(); ++i) {
+        auto offset = offsets[i];
+        auto length = lengths[i];
+
+        auto input_with_nulls = R"([
+          "foo", null, "bar", null, "quu", "foo", "baz", "bar",
+          null, "bar", "baz", null
+          ])";
+
+        auto input_arr_with_nulls = ArrayFromJSON(from_type, input_with_nulls);
+        auto output_arr_with_nulls = ArrayFromJSON(to_type, input_with_nulls);
+        CheckCast(input_arr_with_nulls->Slice(offset),
+                  output_arr_with_nulls->Slice(offset));
+        // Slice with length
+        CheckCast(input_arr_with_nulls->Slice(offset, length),
+                  output_arr_with_nulls->Slice(offset, length));
+
+        auto input_no_nulls = R"([
+            "foo", "aa", "bar", "bb", "quu", "foo", "baz", "bar",
+            "cc", "bar", "baz", "foo"
+            ])";
+
+        auto input_arr_no_nulls = ArrayFromJSON(from_type, input_no_nulls);
+        auto output_arr_no_nulls = ArrayFromJSON(to_type, input_no_nulls);
+        CheckCast(input_arr_no_nulls->Slice(offset), output_arr_no_nulls->Slice(offset));
+        // Slice with length
+        CheckCast(input_arr_no_nulls->Slice(offset, length),
+                  output_arr_no_nulls->Slice(offset, length));
+      }
     }
   }
 }
@@ -2649,37 +3915,34 @@ static void CheckStructToStructSubset(
 
       // field does not exist
       ASSERT_OK_AND_ASSIGN(auto dest6,
-                           StructArray::Make({a1, d1, nulls}, {"a", "d", "f"}));
+                           StructArray::Make({a2, d2, nulls}, {"a", "d", "f"}));
       CheckCast(src, dest6);
 
       const auto dest7 = arrow::struct_(
           {std::make_shared<Field>("a", int8()), std::make_shared<Field>("d", int16()),
            std::make_shared<Field>("f", int64(), /*nullable=*/false)});
       const auto options7 = CastOptions::Safe(dest7);
-      EXPECT_RAISES_WITH_MESSAGE_THAT(
-          TypeError,
-          ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-          Cast(src, options7));
+      EXPECT_RAISES_WITH_MESSAGE_THAT(TypeError,
+                                      ::testing::HasSubstr("struct fields don't match"),
+                                      Cast(src, options7));
 
       // fields in wrong order
-      const auto dest8 = arrow::struct_({std::make_shared<Field>("a", int8()),
-                                         std::make_shared<Field>("c", int16()),
-                                         std::make_shared<Field>("b", int64())});
-      const auto options8 = CastOptions::Safe(dest8);
-      EXPECT_RAISES_WITH_MESSAGE_THAT(
-          TypeError,
-          ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-          Cast(src, options8));
+      ASSERT_OK_AND_ASSIGN(auto dest8, StructArray::Make({a2, c2, b2}, {"a", "c", "b"}));
+      CheckCast(src, dest8);
 
       // duplicate missing field names
-      const auto dest9 = arrow::struct_(
+      ASSERT_OK_AND_ASSIGN(auto dest9,
+                           StructArray::Make({a2, c2, d2, nulls}, {"a", "c", "d", "a"}));
+      CheckCast(src, dest9);
+
+      const auto dest10 = arrow::struct_(
           {std::make_shared<Field>("a", int8()), std::make_shared<Field>("c", int16()),
-           std::make_shared<Field>("d", int32()), std::make_shared<Field>("a", int64())});
-      const auto options9 = CastOptions::Safe(dest9);
-      EXPECT_RAISES_WITH_MESSAGE_THAT(
-          TypeError,
-          ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-          Cast(src, options9));
+           std::make_shared<Field>("d", int32()),
+           std::make_shared<Field>("a", int64(), /*nullable=*/false)});
+      const auto options10 = CastOptions::Safe(dest10);
+      EXPECT_RAISES_WITH_MESSAGE_THAT(TypeError,
+                                      ::testing::HasSubstr("struct fields don't match"),
+                                      Cast(src, options10));
 
       // duplicate present field names
       ASSERT_OK_AND_ASSIGN(
@@ -2699,6 +3962,21 @@ static void CheckStructToStructSubset(
           auto dest3_duplicate_field_names,
           StructArray::Make({a2, b2, c2}, std::vector<std::string>{"a", "a", "a"}));
       CheckCast(src_duplicate_field_names, dest3_duplicate_field_names);
+
+      // more duplicate outputs than duplicate inputs
+      ASSERT_OK_AND_ASSIGN(auto dest4_duplicate_field_names,
+                           StructArray::Make({a2, b2, c2, nulls}, {"a", "a", "a", "a"}));
+      CheckCast(src_duplicate_field_names, dest4_duplicate_field_names);
+
+      const auto dest5_duplicate_field_names = arrow::struct_(
+          {std::make_shared<Field>("a", int8()), std::make_shared<Field>("a", int8()),
+           std::make_shared<Field>("a", int8()),
+           std::make_shared<Field>("a", int8(), /*nullable=*/false)});
+      const auto options5_duplicate_field_names =
+          CastOptions::Safe(dest5_duplicate_field_names);
+      EXPECT_RAISES_WITH_MESSAGE_THAT(
+          TypeError, ::testing::HasSubstr("struct fields don't match"),
+          Cast(src_duplicate_field_names, options5_duplicate_field_names));
     }
   }
 }
@@ -2765,37 +4043,36 @@ static void CheckStructToStructSubsetWithNulls(
       // field does not exist
       ASSERT_OK_AND_ASSIGN(
           auto dest6_null,
-          StructArray::Make({a1, d1, nulls}, {"a", "d", "f"}, null_bitmap));
+          StructArray::Make({a2, d2, nulls}, {"a", "d", "f"}, null_bitmap));
       CheckCast(src_null, dest6_null);
 
       const auto dest7_null = arrow::struct_(
           {std::make_shared<Field>("a", int8()), std::make_shared<Field>("d", int16()),
            std::make_shared<Field>("f", int64(), /*nullable=*/false)});
       const auto options7_null = CastOptions::Safe(dest7_null);
-      EXPECT_RAISES_WITH_MESSAGE_THAT(
-          TypeError,
-          ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-          Cast(src_null, options7_null));
+      EXPECT_RAISES_WITH_MESSAGE_THAT(TypeError,
+                                      ::testing::HasSubstr("struct fields don't match"),
+                                      Cast(src_null, options7_null));
 
       // fields in wrong order
-      const auto dest8_null = arrow::struct_({std::make_shared<Field>("a", int8()),
-                                              std::make_shared<Field>("c", int16()),
-                                              std::make_shared<Field>("b", int64())});
-      const auto options8_null = CastOptions::Safe(dest8_null);
-      EXPECT_RAISES_WITH_MESSAGE_THAT(
-          TypeError,
-          ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-          Cast(src_null, options8_null));
+      ASSERT_OK_AND_ASSIGN(auto dest8_null,
+                           StructArray::Make({a2, c2, b2}, {"a", "c", "b"}, null_bitmap));
+      CheckCast(src_null, dest8_null);
 
       // duplicate missing field names
-      const auto dest9_null = arrow::struct_(
+      ASSERT_OK_AND_ASSIGN(
+          auto dest9_null,
+          StructArray::Make({a2, c2, d2, nulls}, {"a", "c", "d", "a"}, null_bitmap));
+      CheckCast(src_null, dest9_null);
+
+      const auto dest10_null = arrow::struct_(
           {std::make_shared<Field>("a", int8()), std::make_shared<Field>("c", int16()),
-           std::make_shared<Field>("d", int32()), std::make_shared<Field>("a", int64())});
-      const auto options9_null = CastOptions::Safe(dest9_null);
-      EXPECT_RAISES_WITH_MESSAGE_THAT(
-          TypeError,
-          ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-          Cast(src_null, options9_null));
+           std::make_shared<Field>("d", int64()),
+           std::make_shared<Field>("a", int8(), /*nullable=*/false)});
+      const auto options10_null = CastOptions::Safe(dest10_null);
+      EXPECT_RAISES_WITH_MESSAGE_THAT(TypeError,
+                                      ::testing::HasSubstr("struct fields don't match"),
+                                      Cast(src_null, options10_null));
 
       // duplicate present field values
       ASSERT_OK_AND_ASSIGN(
@@ -2818,6 +4095,22 @@ static void CheckStructToStructSubsetWithNulls(
           StructArray::Make({a2, b2, c2}, std::vector<std::string>{"a", "a", "a"},
                             null_bitmap));
       CheckCast(src_duplicate_field_names_null, dest3_duplicate_field_names_null);
+
+      // more duplicate outputs than duplicate inputs
+      ASSERT_OK_AND_ASSIGN(
+          auto dest4_duplicate_field_names_null,
+          StructArray::Make({a2, b2, c2, nulls}, {"a", "a", "a", "a"}, null_bitmap));
+      CheckCast(src_duplicate_field_names_null, dest4_duplicate_field_names_null);
+
+      const auto dest5_duplicate_field_names_null = arrow::struct_(
+          {std::make_shared<Field>("a", int8()), std::make_shared<Field>("a", int8()),
+           std::make_shared<Field>("a", int8()),
+           std::make_shared<Field>("a", int8(), /*nullable=*/false)});
+      const auto options5_duplicate_field_names_null =
+          CastOptions::Safe(dest5_duplicate_field_names_null);
+      EXPECT_RAISES_WITH_MESSAGE_THAT(
+          TypeError, ::testing::HasSubstr("struct fields don't match"),
+          Cast(src_duplicate_field_names_null, options5_duplicate_field_names_null));
     }
   }
 }
@@ -2848,9 +4141,7 @@ TEST(Cast, StructToSameSizedButDifferentNamedStruct) {
   const auto options2 = CastOptions::Safe(dest2);
 
   EXPECT_RAISES_WITH_MESSAGE_THAT(
-      TypeError,
-      ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-      Cast(src, options2));
+      TypeError, ::testing::HasSubstr("struct fields don't match"), Cast(src, options2));
 }
 
 TEST(Cast, StructToBiggerStruct) {
@@ -2866,9 +4157,7 @@ TEST(Cast, StructToBiggerStruct) {
   const auto options1 = CastOptions::Safe(dest1);
 
   EXPECT_RAISES_WITH_MESSAGE_THAT(
-      TypeError,
-      ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-      Cast(src, options1));
+      TypeError, ::testing::HasSubstr("struct fields don't match"), Cast(src, options1));
 
   const auto dest2 =
       arrow::struct_({std::make_shared<Field>("a", int8()),
@@ -2877,9 +4166,7 @@ TEST(Cast, StructToBiggerStruct) {
   const auto options2 = CastOptions::Safe(dest2);
 
   EXPECT_RAISES_WITH_MESSAGE_THAT(
-      TypeError,
-      ::testing::HasSubstr("struct fields don't match or are in the wrong order"),
-      Cast(src, options2));
+      TypeError, ::testing::HasSubstr("struct fields don't match"), Cast(src, options2));
 }
 
 TEST(Cast, StructToBiggerNullableStruct) {
@@ -2900,92 +4187,95 @@ TEST(Cast, StructToBiggerNullableStruct) {
 TEST(Cast, StructToDifferentNullabilityStruct) {
   {
     // OK to go from non-nullable to nullable...
-    std::vector<std::shared_ptr<Field>> fields_src_non_nullable = {
+    std::vector<std::shared_ptr<Field>> fields_src = {
         std::make_shared<Field>("a", int8(), false),
         std::make_shared<Field>("b", int8(), false),
         std::make_shared<Field>("c", int8(), false)};
-    std::shared_ptr<Array> a_src_non_nullable, b_src_non_nullable, c_src_non_nullable;
-    a_src_non_nullable = ArrayFromJSON(int8(), "[11, 23, 56]");
-    b_src_non_nullable = ArrayFromJSON(int8(), "[32, 46, 37]");
-    c_src_non_nullable = ArrayFromJSON(int8(), "[95, 11, 44]");
-    ASSERT_OK_AND_ASSIGN(
-        auto src_non_nullable,
-        StructArray::Make({a_src_non_nullable, b_src_non_nullable, c_src_non_nullable},
-                          fields_src_non_nullable));
+    std::vector<std::shared_ptr<Array>> arrays_src = {
+        ArrayFromJSON(int8(), "[11, 23, 56]"),
+        ArrayFromJSON(int8(), "[32, 46, 37]"),
+        ArrayFromJSON(int8(), "[95, 11, 44]"),
+    };
+    ASSERT_OK_AND_ASSIGN(auto src, StructArray::Make(arrays_src, fields_src));
 
-    std::shared_ptr<Array> a_dest_nullable, b_dest_nullable, c_dest_nullable;
-    a_dest_nullable = ArrayFromJSON(int64(), "[11, 23, 56]");
-    b_dest_nullable = ArrayFromJSON(int64(), "[32, 46, 37]");
-    c_dest_nullable = ArrayFromJSON(int64(), "[95, 11, 44]");
-
-    std::vector<std::shared_ptr<Field>> fields_dest1_nullable = {
+    std::vector<std::shared_ptr<Field>> fields_dest = {
         std::make_shared<Field>("a", int64(), true),
         std::make_shared<Field>("b", int64(), true),
-        std::make_shared<Field>("c", int64(), true)};
-    ASSERT_OK_AND_ASSIGN(
-        auto dest1_nullable,
-        StructArray::Make({a_dest_nullable, b_dest_nullable, c_dest_nullable},
-                          fields_dest1_nullable));
-    CheckCast(src_non_nullable, dest1_nullable);
+        std::make_shared<Field>("c", int64(), true),
+    };
+    std::vector<std::shared_ptr<Array>> arrays_dest = {
+        ArrayFromJSON(int64(), "[11, 23, 56]"),
+        ArrayFromJSON(int64(), "[32, 46, 37]"),
+        ArrayFromJSON(int64(), "[95, 11, 44]"),
+    };
+    ASSERT_OK_AND_ASSIGN(auto dest, StructArray::Make(arrays_dest, fields_dest));
+    CheckCast(src, dest);
 
-    std::vector<std::shared_ptr<Field>> fields_dest2_nullable = {
-        std::make_shared<Field>("a", int64(), true),
-        std::make_shared<Field>("c", int64(), true)};
-    ASSERT_OK_AND_ASSIGN(
-        auto dest2_nullable,
-        StructArray::Make({a_dest_nullable, c_dest_nullable}, fields_dest2_nullable));
-    CheckCast(src_non_nullable, dest2_nullable);
+    std::vector<std::shared_ptr<Field>> fields_dest_ac = {fields_dest[0], fields_dest[2]};
+    std::vector<std::shared_ptr<Array>> arrays_dest_ac = {arrays_dest[0], arrays_dest[2]};
+    ASSERT_OK_AND_ASSIGN(auto dest_ac, StructArray::Make(arrays_dest_ac, fields_dest_ac));
+    CheckCast(src, dest_ac);
 
-    std::vector<std::shared_ptr<Field>> fields_dest3_nullable = {
-        std::make_shared<Field>("b", int64(), true)};
-    ASSERT_OK_AND_ASSIGN(auto dest3_nullable,
-                         StructArray::Make({b_dest_nullable}, fields_dest3_nullable));
-    CheckCast(src_non_nullable, dest3_nullable);
+    std::vector<std::shared_ptr<Field>> fields_dest_b = {fields_dest[1]};
+    std::vector<std::shared_ptr<Array>> arrays_dest_b = {arrays_dest[1]};
+    ASSERT_OK_AND_ASSIGN(auto dest_b, StructArray::Make(arrays_dest_b, fields_dest_b));
+    CheckCast(src, dest_b);
   }
   {
-    // But NOT OK to go from nullable to non-nullable...
-    std::vector<std::shared_ptr<Field>> fields_src_nullable = {
+    // But when going from nullable to non-nullable, all data must be non-null...
+    std::vector<std::shared_ptr<Field>> fields_src = {
         std::make_shared<Field>("a", int8(), true),
         std::make_shared<Field>("b", int8(), true),
         std::make_shared<Field>("c", int8(), true)};
-    std::shared_ptr<Array> a_src_nullable, b_src_nullable, c_src_nullable;
-    a_src_nullable = ArrayFromJSON(int8(), "[1, null, 5]");
-    b_src_nullable = ArrayFromJSON(int8(), "[3, 4, null]");
-    c_src_nullable = ArrayFromJSON(int8(), "[9, 11, 44]");
-    ASSERT_OK_AND_ASSIGN(
-        auto src_nullable,
-        StructArray::Make({a_src_nullable, b_src_nullable, c_src_nullable},
-                          fields_src_nullable));
+    std::vector<std::shared_ptr<Array>> arrays_src = {
+        ArrayFromJSON(int8(), "[1, null, 5]"),
+        ArrayFromJSON(int8(), "[3, 4, null]"),
+        ArrayFromJSON(int8(), "[9, 11, 44]"),
+    };
+    ASSERT_OK_AND_ASSIGN(auto src, StructArray::Make(arrays_src, fields_src));
 
-    std::vector<std::shared_ptr<Field>> fields_dest1_non_nullable = {
+    std::vector<std::shared_ptr<Field>> fields_dest = {
         std::make_shared<Field>("a", int64(), false),
         std::make_shared<Field>("b", int64(), false),
         std::make_shared<Field>("c", int64(), false)};
-    const auto dest1_non_nullable = arrow::struct_(fields_dest1_non_nullable);
-    const auto options1_non_nullable = CastOptions::Safe(dest1_non_nullable);
     EXPECT_RAISES_WITH_MESSAGE_THAT(
-        TypeError,
-        ::testing::HasSubstr("cannot cast nullable field to non-nullable field"),
-        Cast(src_nullable, options1_non_nullable));
+        Invalid,
+        ::testing::HasSubstr(
+            "field 'a' of type int8 has nulls. Can't cast to non-nullable field 'a' "
+            "of type int64"),
+        Cast(src, CastOptions::Safe(arrow::struct_(fields_dest))));
 
-    std::vector<std::shared_ptr<Field>> fields_dest2_non_nullable = {
-        std::make_shared<Field>("a", int64(), false),
-        std::make_shared<Field>("c", int64(), false)};
-    const auto dest2_non_nullable = arrow::struct_(fields_dest2_non_nullable);
-    const auto options2_non_nullable = CastOptions::Safe(dest2_non_nullable);
+    std::vector<std::shared_ptr<Field>> fields_dest_ac = {fields_dest[0], fields_dest[2]};
     EXPECT_RAISES_WITH_MESSAGE_THAT(
-        TypeError,
-        ::testing::HasSubstr("cannot cast nullable field to non-nullable field"),
-        Cast(src_nullable, options2_non_nullable));
+        Invalid,
+        ::testing::HasSubstr(
+            "field 'a' of type int8 has nulls. Can't cast to non-nullable field 'a' "
+            "of type int64"),
+        Cast(src, CastOptions::Safe(arrow::struct_(fields_dest_ac))));
 
-    std::vector<std::shared_ptr<Field>> fields_dest3_non_nullable = {
-        std::make_shared<Field>("c", int64(), false)};
-    const auto dest3_non_nullable = arrow::struct_(fields_dest3_non_nullable);
-    const auto options3_non_nullable = CastOptions::Safe(dest3_non_nullable);
+    // if we only select a field with no nulls, it should be fine:
+    std::vector<std::shared_ptr<Field>> fields_dest_c = {fields_dest[2]};
+    std::vector<std::shared_ptr<Array>> arrays_dest_c = {
+        ArrayFromJSON(int64(), "[9, 11, 44]")};
+    ASSERT_OK_AND_ASSIGN(auto dest_c, StructArray::Make(arrays_dest_c, fields_dest_c));
+    CheckCast(src, dest_c);
+
+    // A slice that doesn't contain nulls is castable...
+    std::vector<std::shared_ptr<Array>> arrays_dest_0 = {
+        ArrayFromJSON(int64(), "[1]"),
+        ArrayFromJSON(int64(), "[3]"),
+        ArrayFromJSON(int64(), "[9]"),
+    };
+    ASSERT_OK_AND_ASSIGN(auto dest_0, StructArray::Make(arrays_dest_0, fields_dest));
+    CheckCast(src->Slice(0, 1), dest_0);
+
+    // ...but a slice that contains nulls will error.
     EXPECT_RAISES_WITH_MESSAGE_THAT(
-        TypeError,
-        ::testing::HasSubstr("cannot cast nullable field to non-nullable field"),
-        Cast(src_nullable, options3_non_nullable));
+        Invalid,
+        ::testing::HasSubstr(
+            "field 'a' of type int8 has nulls. Can't cast to non-nullable field 'a' "
+            "of type int64"),
+        Cast(src->Slice(1, 3), CastOptions::Safe(arrow::struct_(fields_dest))));
   }
 }
 

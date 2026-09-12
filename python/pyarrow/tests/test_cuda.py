@@ -32,7 +32,7 @@ except ImportError:
     pytestmark = pytest.mark.numpy
 
 
-cuda = pytest.importorskip("pyarrow.cuda")
+cuda = pytest.importorskip("pyarrow.cuda", exc_type=ImportError)
 
 platform = sysconfig.get_platform()
 # TODO: enable ppc64 when Arrow C++ supports IPC in ppc64 systems:
@@ -296,14 +296,6 @@ def test_foreign_buffer():
     fbuf = ctx.foreign_buffer(hbuf.address, hbuf.size, hbuf)
     del hbuf
     fbuf.copy_to_host()
-
-    # test deallocating the host buffer memory making it inaccessible
-    hbuf = cuda.new_host_buffer(size * dtype.itemsize)
-    fbuf = ctx.foreign_buffer(hbuf.address, hbuf.size)
-    del hbuf
-    with pytest.raises(pa.ArrowIOError,
-                       match=('Cuda error ')):
-        fbuf.copy_to_host()
 
 
 @pytest.mark.parametrize("size", [0, 1, 1000])
@@ -747,8 +739,10 @@ def make_table():
         dictionary=a2)
 
     arrays = [a0, a1, a2, a3, a4, a5]
-    schema = pa.schema([('f{}'.format(i), arr.type)
-                        for i, arr in enumerate(arrays)])
+    schema = pa.schema([
+        (f'f{i}', arr.type)
+        for i, arr in enumerate(arrays)
+    ])
     batch = pa.record_batch(arrays, schema=schema)
     table = pa.Table.from_batches([batch])
     return table
@@ -856,7 +850,7 @@ def test_copy_to():
 
 
 def test_device_interface_array():
-    cffi = pytest.importorskip("pyarrow.cffi")
+    cffi = pytest.importorskip("pyarrow.cffi", exc_type=ImportError)
     ffi = cffi.ffi
 
     c_schema = ffi.new("struct ArrowSchema*")
@@ -909,7 +903,7 @@ def test_device_interface_array():
 
 
 def test_device_interface_batch_array():
-    cffi = pytest.importorskip("pyarrow.cffi")
+    cffi = pytest.importorskip("pyarrow.cffi", exc_type=ImportError)
     ffi = cffi.ffi
 
     c_schema = ffi.new("struct ArrowSchema*")

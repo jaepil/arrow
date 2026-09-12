@@ -18,10 +18,10 @@
 #pragma once
 
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
-#include "arrow/util/span.h"
 #include "parquet/properties.h"
 #include "parquet/types.h"
 
@@ -53,10 +53,7 @@ class PARQUET_EXPORT AesEncryptor {
                         bool write_length = true);
 
   static std::unique_ptr<AesEncryptor> Make(ParquetCipher::type alg_id, int32_t key_len,
-                                            bool metadata);
-
-  static std::unique_ptr<AesEncryptor> Make(ParquetCipher::type alg_id, int32_t key_len,
-                                            bool metadata, bool write_length);
+                                            bool metadata, bool write_length = true);
 
   ~AesEncryptor();
 
@@ -65,19 +62,14 @@ class PARQUET_EXPORT AesEncryptor {
 
   /// Encrypts plaintext with the key and aad. Key length is passed only for validation.
   /// If different from value in constructor, exception will be thrown.
-  int32_t Encrypt(::arrow::util::span<const uint8_t> plaintext,
-                  ::arrow::util::span<const uint8_t> key,
-                  ::arrow::util::span<const uint8_t> aad,
-                  ::arrow::util::span<uint8_t> ciphertext);
+  int32_t Encrypt(std::span<const uint8_t> plaintext, std::span<const uint8_t> key,
+                  std::span<const uint8_t> aad, std::span<uint8_t> ciphertext);
 
   /// Encrypts plaintext footer, in order to compute footer signature (tag).
-  int32_t SignedFooterEncrypt(::arrow::util::span<const uint8_t> footer,
-                              ::arrow::util::span<const uint8_t> key,
-                              ::arrow::util::span<const uint8_t> aad,
-                              ::arrow::util::span<const uint8_t> nonce,
-                              ::arrow::util::span<uint8_t> encrypted_footer);
-
-  void WipeOut();
+  int32_t SignedFooterEncrypt(std::span<const uint8_t> footer,
+                              std::span<const uint8_t> key, std::span<const uint8_t> aad,
+                              std::span<const uint8_t> nonce,
+                              std::span<uint8_t> encrypted_footer);
 
  private:
   // PIMPL Idiom
@@ -88,25 +80,19 @@ class PARQUET_EXPORT AesEncryptor {
 /// Performs AES decryption operations with GCM or CTR ciphers.
 class PARQUET_EXPORT AesDecryptor {
  public:
-  /// Can serve one key length only. Possible values: 16, 24, 32 bytes.
-  /// If contains_length is true, expect ciphertext length prepended to the ciphertext
-  explicit AesDecryptor(ParquetCipher::type alg_id, int32_t key_len, bool metadata,
-                        bool contains_length = true);
-
-  /// \brief Factory function to create an AesDecryptor
+  /// \brief Construct an AesDecryptor
   ///
   /// \param alg_id the encryption algorithm to use
   /// \param key_len key length. Possible values: 16, 24, 32 bytes.
   /// \param metadata if true then this is a metadata decryptor
-  /// \param all_decryptors A weak reference to all decryptors that need to be wiped
-  /// out when decryption is finished
-  /// \return shared pointer to a new AesDecryptor
-  static std::shared_ptr<AesDecryptor> Make(
-      ParquetCipher::type alg_id, int32_t key_len, bool metadata,
-      std::vector<std::weak_ptr<AesDecryptor>>* all_decryptors);
+  /// \param contains_length if true, expect ciphertext length prepended to the ciphertext
+  explicit AesDecryptor(ParquetCipher::type alg_id, int32_t key_len, bool metadata,
+                        bool contains_length = true);
+
+  static std::unique_ptr<AesDecryptor> Make(ParquetCipher::type alg_id, int32_t key_len,
+                                            bool metadata);
 
   ~AesDecryptor();
-  void WipeOut();
 
   /// The size of the plaintext, for this cipher and the specified ciphertext length.
   [[nodiscard]] int32_t PlaintextLength(int32_t ciphertext_len) const;
@@ -118,10 +104,8 @@ class PARQUET_EXPORT AesDecryptor {
   /// validation. If different from value in constructor, exception will be thrown.
   /// The caller is responsible for ensuring that the plaintext buffer is at least as
   /// large as PlaintextLength(ciphertext_len).
-  int32_t Decrypt(::arrow::util::span<const uint8_t> ciphertext,
-                  ::arrow::util::span<const uint8_t> key,
-                  ::arrow::util::span<const uint8_t> aad,
-                  ::arrow::util::span<uint8_t> plaintext);
+  int32_t Decrypt(std::span<const uint8_t> ciphertext, std::span<const uint8_t> key,
+                  std::span<const uint8_t> aad, std::span<uint8_t> plaintext);
 
  private:
   // PIMPL Idiom

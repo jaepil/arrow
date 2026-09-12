@@ -39,9 +39,7 @@ else()
 endif()
 
 set(ARROW_UTILITY_TEST_LINK_LIBS Boost::headers)
-if(ARROW_USE_XSIMD)
-  list(APPEND ARROW_UTILITY_TEST_LINK_LIBS ${ARROW_XSIMD})
-endif()
+list(APPEND ARROW_UTILITY_TEST_LINK_LIBS ${ARROW_XSIMD})
 if(ARROW_WITH_OPENTELEMETRY)
   list(APPEND ARROW_UTILITY_TEST_LINK_LIBS ${ARROW_OPENTELEMETRY_LIBS})
 endif()
@@ -49,6 +47,7 @@ add_arrow_test(utility-test
                SOURCES
                align_util_test.cc
                atfork_test.cc
+               base64_test.cc
                byte_size_test.cc
                byte_stream_split_test.cc
                cache_test.cc
@@ -66,13 +65,14 @@ add_arrow_test(utility-test
                list_util_test.cc
                logger_test.cc
                logging_test.cc
+               math_test.cc
                queue_test.cc
                range_test.cc
                ree_util_test.cc
                reflection_test.cc
                rows_to_batches_test.cc
+               secure_string_test.cc
                small_vector_test.cc
-               span_test.cc
                stl_util_test.cc
                string_test.cc
                tdigest_test.cc
@@ -81,10 +81,19 @@ add_arrow_test(utility-test
                tracing_test.cc
                trie_test.cc
                uri_test.cc
+               ulp_distance_test.cc
                utf8_util_test.cc
                value_parsing_test.cc
                EXTRA_LINK_LIBS
                ${ARROW_UTILITY_TEST_LINK_LIBS})
+
+if(ARROW_WITH_SIMDJSON)
+  add_arrow_test(simdjson-internal-test
+                 SOURCES
+                 simdjson_internal_test.cc
+                 EXTRA_LINK_LIBS
+                 arrow::simdjson)
+endif()
 
 add_arrow_test(async-utility-test
                SOURCES
@@ -96,7 +105,17 @@ add_arrow_test(bit-utility-test
                SOURCES
                bit_block_counter_test.cc
                bit_util_test.cc
-               rle_encoding_test.cc)
+               bitmap_test.cc
+               bpacking_test.cc
+               rle_bitmap_test.cc
+               rle_encoding_test.cc
+               test_common.cc)
+
+add_arrow_test(crc32-test
+               SOURCES
+               crc32_test.cc
+               EXTRA_LINK_LIBS
+               Boost::headers)
 
 add_arrow_test(threading-utility-test
                SOURCES
@@ -107,15 +126,10 @@ add_arrow_test(threading-utility-test
                test_common.cc
                thread_pool_test.cc)
 
-add_arrow_test(crc32-test
-               SOURCES
-               crc32_test.cc
-               EXTRA_LINK_LIBS
-               Boost::headers)
-
 add_arrow_benchmark(bit_block_counter_benchmark)
 add_arrow_benchmark(bit_util_benchmark)
 add_arrow_benchmark(bitmap_reader_benchmark)
+add_arrow_benchmark(bpacking_benchmark)
 add_arrow_benchmark(cache_benchmark)
 add_arrow_benchmark(compression_benchmark)
 add_arrow_benchmark(decimal_benchmark)
@@ -129,9 +143,7 @@ add_arrow_benchmark(tdigest_benchmark)
 add_arrow_benchmark(thread_pool_benchmark)
 add_arrow_benchmark(trie_benchmark)
 set(ARROW_BENCHMARK_UTF8_UTIL_LINK_LIBS)
-if(ARROW_USE_XSIMD)
-  list(APPEND ARROW_BENCHMARK_UTF8_UTIL_LINK_LIBS ${ARROW_XSIMD})
-endif()
+list(APPEND ARROW_BENCHMARK_UTF8_UTIL_LINK_LIBS ${ARROW_XSIMD})
 add_arrow_benchmark(utf8_util_benchmark EXTRA_LINK_LIBS
                     ${ARROW_BENCHMARK_UTF8_UTIL_LINK_LIBS})
 add_arrow_benchmark(value_parsing_benchmark)

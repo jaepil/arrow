@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -45,7 +46,7 @@
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/future.h"
 #include "arrow/util/key_value_metadata.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/range.h"
 #include "arrow/util/small_vector.h"
@@ -578,16 +579,19 @@ struct ArrayExporter {
     // This is because ARROW-9037 is in version 0.17 and 0.17.1, and they are
     // not able to import arrays without a null bitmap and null_count == -1.
     data->GetNullCount();
+
+    const auto physical_type_id = data->type->storage_id();
+
     // Store buffer pointers
     size_t n_buffers = data->buffers.size();
     auto buffers_begin = data->buffers.begin();
-    if (n_buffers > 0 && !internal::may_have_validity_bitmap(data->type->id())) {
+    if (n_buffers > 0 && !internal::may_have_validity_bitmap(physical_type_id)) {
       --n_buffers;
       ++buffers_begin;
     }
 
     bool need_variadic_buffer_sizes =
-        data->type->id() == Type::BINARY_VIEW || data->type->id() == Type::STRING_VIEW;
+        physical_type_id == Type::BINARY_VIEW || physical_type_id == Type::STRING_VIEW;
     if (need_variadic_buffer_sizes) {
       ++n_buffers;
     }
@@ -603,10 +607,15 @@ struct ArrayExporter {
                    });
 
     if (need_variadic_buffer_sizes) {
-      auto variadic_buffers = util::span(data->buffers).subspan(2);
+      auto variadic_buffers = std::span(data->buffers).subspan(2);
       export_.variadic_buffer_sizes_.resize(variadic_buffers.size());
       size_t i = 0;
       for (const auto& buf : variadic_buffers) {
+        if (buf == nullptr) {
+          return Status::Invalid("Cannot export array of type ", data->type->ToString(),
+                                 ": null variadic buffer at buffer index #", i + 2,
+                                 " (variadic buffer index #", i, ")");
+        }
         export_.variadic_buffer_sizes_[i++] = buf->size();
       }
       export_.buffers_.back() = export_.variadic_buffer_sizes_.data();
@@ -713,6 +722,8 @@ Status ExportRecordBatch(const RecordBatch& batch, struct ArrowArray* out,
 //////////////////////////////////////////////////////////////////////////
 // C device arrays
 
+namespace {
+
 Status ValidateDeviceInfo(const ArrayData& data,
                           std::optional<DeviceAllocationType>* device_type,
                           int64_t* device_id) {
@@ -752,6 +763,8 @@ Result<std::pair<std::optional<DeviceAllocationType>, int64_t>> ValidateDeviceIn
   RETURN_NOT_OK(ValidateDeviceInfo(data, &device_type, &device_id));
   return std::make_pair(device_type, device_id);
 }
+
+}  // namespace
 
 Status ExportDeviceArray(const Array& array, std::shared_ptr<Device::SyncEvent> sync,
                          struct ArrowDeviceArray* out, struct ArrowSchema* out_schema) {
@@ -1255,15 +1268,15 @@ struct SchemaImporter {
       return f_parser_.Invalid();
     }
     if (prec_scale.size() == 2) {
-      type_ = decimal128(prec_scale[0], prec_scale[1]);
+      ARROW_ASSIGN_OR_RAISE(type_, Decimal128Type::Make(prec_scale[0], prec_scale[1]));
     } else if (prec_scale[2] == 32) {
-      type_ = decimal32(prec_scale[0], prec_scale[1]);
+      ARROW_ASSIGN_OR_RAISE(type_, Decimal32Type::Make(prec_scale[0], prec_scale[1]));
     } else if (prec_scale[2] == 64) {
-      type_ = decimal64(prec_scale[0], prec_scale[1]);
+      ARROW_ASSIGN_OR_RAISE(type_, Decimal64Type::Make(prec_scale[0], prec_scale[1]));
     } else if (prec_scale[2] == 128) {
-      type_ = decimal128(prec_scale[0], prec_scale[1]);
+      ARROW_ASSIGN_OR_RAISE(type_, Decimal128Type::Make(prec_scale[0], prec_scale[1]));
     } else if (prec_scale[2] == 256) {
-      type_ = decimal256(prec_scale[0], prec_scale[1]);
+      ARROW_ASSIGN_OR_RAISE(type_, Decimal256Type::Make(prec_scale[0], prec_scale[1]));
     } else {
       return f_parser_.Invalid();
     }

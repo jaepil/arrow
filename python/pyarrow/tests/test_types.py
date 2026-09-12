@@ -20,6 +20,7 @@ from collections.abc import Iterator, Mapping
 from functools import partial
 import datetime
 import sys
+import zoneinfo
 
 import pytest
 import hypothesis as h
@@ -57,6 +58,8 @@ def get_many_types():
         pa.float16(),
         pa.float32(),
         pa.float64(),
+        pa.decimal32(9, 4),
+        pa.decimal64(18, 4),
         pa.decimal128(19, 4),
         pa.decimal256(76, 38),
         pa.string(),
@@ -139,18 +142,38 @@ def test_null_field_may_not_be_non_nullable():
 
 
 def test_is_decimal():
+    decimal32 = pa.decimal32(9, 4)
+    decimal64 = pa.decimal64(18, 4)
     decimal128 = pa.decimal128(19, 4)
     decimal256 = pa.decimal256(76, 38)
     int32 = pa.int32()
 
+    assert types.is_decimal(decimal32)
+    assert types.is_decimal(decimal64)
     assert types.is_decimal(decimal128)
     assert types.is_decimal(decimal256)
     assert not types.is_decimal(int32)
 
+    assert types.is_decimal32(decimal32)
+    assert not types.is_decimal32(decimal64)
+    assert not types.is_decimal32(decimal128)
+    assert not types.is_decimal32(decimal256)
+    assert not types.is_decimal32(int32)
+
+    assert not types.is_decimal64(decimal32)
+    assert types.is_decimal64(decimal64)
+    assert not types.is_decimal64(decimal128)
+    assert not types.is_decimal64(decimal256)
+    assert not types.is_decimal64(int32)
+
+    assert not types.is_decimal128(decimal32)
+    assert not types.is_decimal128(decimal64)
     assert types.is_decimal128(decimal128)
     assert not types.is_decimal128(decimal256)
     assert not types.is_decimal128(int32)
 
+    assert not types.is_decimal256(decimal32)
+    assert not types.is_decimal256(decimal64)
     assert not types.is_decimal256(decimal128)
     assert types.is_decimal256(decimal256)
     assert not types.is_decimal256(int32)
@@ -221,7 +244,10 @@ def test_is_nested_or_struct():
     assert types.is_nested(pa.large_list(pa.int32()))
     assert types.is_nested(pa.list_view(pa.int32()))
     assert types.is_nested(pa.large_list_view(pa.int32()))
+    assert types.is_nested(pa.map_(pa.string(), pa.int32()))
+    assert types.is_nested(pa.run_end_encoded(pa.int32(), pa.string()))
     assert not types.is_nested(pa.int32())
+    assert not types.is_nested(pa.dictionary(pa.int32(), pa.string()))
 
 
 def test_is_union():
@@ -236,9 +262,6 @@ def test_is_union():
 def test_is_run_end_encoded():
     assert types.is_run_end_encoded(pa.run_end_encoded(pa.int32(), pa.int64()))
     assert not types.is_run_end_encoded(pa.utf8())
-
-
-# TODO(wesm): is_map, once implemented
 
 
 def test_is_binary_string():
@@ -472,35 +495,45 @@ def test_convert_custom_tzinfo_objects_to_string():
 
 def test_string_to_tzinfo():
     string = ['UTC', 'Europe/Paris', '+03:00', '+01:30', '-02:00']
-    try:
-        import pytz
-        expected = [pytz.utc, pytz.timezone('Europe/Paris'),
-                    pytz.FixedOffset(180), pytz.FixedOffset(90),
-                    pytz.FixedOffset(-120)]
-        result = [pa.lib.string_to_tzinfo(i) for i in string]
-        assert result == expected
-
-    except ImportError:
-        try:
-            import zoneinfo
-            expected = [zoneinfo.ZoneInfo(key='UTC'),
-                        zoneinfo.ZoneInfo(key='Europe/Paris'),
-                        datetime.timezone(datetime.timedelta(hours=3)),
-                        datetime.timezone(
-                            datetime.timedelta(hours=1, minutes=30)),
-                        datetime.timezone(-datetime.timedelta(hours=2))]
-            result = [pa.lib.string_to_tzinfo(i) for i in string]
-            assert result == expected
-
-        except ImportError:
-            pytest.skip('requires pytz or zoneinfo to be installed')
+    result = [pa.lib.string_to_tzinfo(i) for i in string]
+    expected = [
+        zoneinfo.ZoneInfo('UTC'),
+        zoneinfo.ZoneInfo('Europe/Paris'),
+        datetime.timezone(datetime.timedelta(hours=3)),
+        datetime.timezone(datetime.timedelta(hours=1, minutes=30)),
+        datetime.timezone(-datetime.timedelta(hours=2)),
+    ]
+    assert result == expected
 
 
-def test_timezone_string_roundtrip_pytz():
+def test_string_to_tzinfo_prefer_zoneinfo_false():
+    pytz = pytest.importorskip("pytz")
+    result = pa.lib.string_to_tzinfo("Europe/Brussels", prefer_zoneinfo=False)
+    assert result == pytz.timezone("Europe/Brussels")
+    result = pa.lib.string_to_tzinfo("+01:30", prefer_zoneinfo=False)
+    assert result == pytz.FixedOffset(90)
+
+
+def test_string_to_tzinfo_pytz_fallback():
     pytz = pytest.importorskip("pytz")
 
-    tz = [pytz.FixedOffset(90), pytz.FixedOffset(-90),
-          pytz.utc, pytz.timezone('America/New_York')]
+    try:
+        zoneinfo.ZoneInfo("europe/brussels")
+    except zoneinfo.ZoneInfoNotFoundError:
+        pass
+    else:
+        pytest.skip("zoneinfo supports lower-case names on this platform")
+
+    result = pa.lib.string_to_tzinfo("europe/brussels")
+    expected = pytz.timezone("Europe/Brussels")
+    assert result == expected
+
+
+def test_timezone_string_roundtrip():
+    tz = [datetime.timezone(datetime.timedelta(hours=1, minutes=30)),
+          datetime.timezone(datetime.timedelta(hours=-1, minutes=-30)),
+          zoneinfo.ZoneInfo('UTC'),
+          zoneinfo.ZoneInfo('America/New_York')]
     name = ['+01:30', '-01:30', 'UTC', 'America/New_York']
 
     assert [pa.lib.tzinfo_to_string(i) for i in tz] == name
@@ -536,7 +569,7 @@ def test_time32_units():
         assert ty.unit == valid_unit
 
     for invalid_unit in ('m', 'us', 'ns'):
-        error_msg = 'Invalid time unit for time32: {!r}'.format(invalid_unit)
+        error_msg = f'Invalid time unit for time32: {invalid_unit!r}'
         with pytest.raises(ValueError, match=error_msg):
             pa.time32(invalid_unit)
 
@@ -547,7 +580,7 @@ def test_time64_units():
         assert ty.unit == valid_unit
 
     for invalid_unit in ('m', 's', 'ms'):
-        error_msg = 'Invalid time unit for time64: {!r}'.format(invalid_unit)
+        error_msg = f'Invalid time unit for time64: {invalid_unit!r}'
         with pytest.raises(ValueError, match=error_msg):
             pa.time64(invalid_unit)
 
@@ -970,6 +1003,8 @@ def test_bit_and_byte_width():
         (pa.float16(), 16, 2),
         (pa.timestamp('s'), 64, 8),
         (pa.date32(), 32, 4),
+        (pa.decimal32(9, 4), 32, 4),
+        (pa.decimal64(18, 4), 64, 8),
         (pa.decimal128(19, 4), 128, 16),
         (pa.decimal256(76, 38), 256, 32),
         (pa.binary(42), 42 * 8, 42),
@@ -1002,6 +1037,14 @@ def test_fixed_size_binary_byte_width():
 
 
 def test_decimal_properties():
+    ty = pa.decimal32(9, 4)
+    assert ty.byte_width == 4
+    assert ty.precision == 9
+    assert ty.scale == 4
+    ty = pa.decimal64(18, 4)
+    assert ty.byte_width == 8
+    assert ty.precision == 18
+    assert ty.scale == 4
     ty = pa.decimal128(19, 4)
     assert ty.byte_width == 16
     assert ty.precision == 19
@@ -1013,6 +1056,18 @@ def test_decimal_properties():
 
 
 def test_decimal_overflow():
+    pa.decimal32(1, 0)
+    pa.decimal32(9, 0)
+    for i in (0, -1, 10):
+        with pytest.raises(ValueError):
+            pa.decimal32(i, 0)
+
+    pa.decimal64(1, 0)
+    pa.decimal64(18, 0)
+    for i in (0, -1, 19):
+        with pytest.raises(ValueError):
+            pa.decimal64(i, 0)
+
     pa.decimal128(1, 0)
     pa.decimal128(38, 0)
     for i in (0, -1, 39):
@@ -1298,8 +1353,8 @@ def test_is_boolean_value():
     assert pa.types.is_boolean_value(True)
     assert pa.types.is_boolean_value(False)
     if np is not None:
-        assert pa.types.is_boolean_value(np.bool_(True))
-        assert pa.types.is_boolean_value(np.bool_(False))
+        assert pa.types.is_boolean_value(np.bool(True))
+        assert pa.types.is_boolean_value(np.bool(False))
 
 
 @h.settings(suppress_health_check=(h.HealthCheck.too_slow,))
@@ -1401,3 +1456,16 @@ def test_field_import_c_schema_interface():
     assert pa.field(wrapped_field, nullable=False).nullable is False
     result = pa.field(wrapped_field, metadata={"other": "meta"})
     assert result.metadata == {b"other": b"meta"}
+
+
+def test_types_enum():
+    # GH-47123: [Python] Add Enums to PyArrow Types
+    # Since not all the underlying types are implemented in PyArrow,
+    # test only the ones that were imported specifically for this Enum
+
+    import pyarrow.lib as lib
+
+    types_enum = types.TypesEnum
+
+    assert types_enum.INTERVAL_MONTHS.value == lib.Type_INTERVAL_MONTHS
+    assert types_enum.INTERVAL_DAY_TIME.value == lib.Type_INTERVAL_DAY_TIME

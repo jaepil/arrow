@@ -20,6 +20,8 @@
 
 from libc.stdlib cimport malloc, free
 
+from cpython.bytearray cimport PyByteArray_FromStringAndSize
+
 import codecs
 import pickle
 import re
@@ -42,9 +44,6 @@ cdef extern from "Python.h":
     # To let us get a PyObject* and avoid Cython auto-ref-counting
     PyObject* PyBytes_FromStringAndSizeNative" PyBytes_FromStringAndSize"(
         char *v, Py_ssize_t len) except NULL
-
-    # Workaround https://github.com/cython/cython/issues/4707
-    bytearray PyByteArray_FromStringAndSize(char *string, Py_ssize_t len)
 
 
 def have_libhdfs():
@@ -336,8 +335,7 @@ cdef class NativeFile(_Weakrefable):
                 offset = offset + position
             else:
                 with gil:
-                    raise ValueError("Invalid value of whence: {0}"
-                                     .format(whence))
+                    raise ValueError(f"Invalid value of whence: {whence}")
             check_status(handle.get().Seek(offset))
 
         return self.tell()
@@ -550,6 +548,8 @@ cdef class NativeFile(_Weakrefable):
         handle = self.get_input_stream()
 
         py_buf = py_buffer(b)
+        if not py_buf.buffer.get().is_mutable():
+            raise TypeError("readinto() argument must be a writable buffer")
         buf_len = py_buf.size
         buf = py_buf.buffer.get().mutable_data()
 
@@ -703,8 +703,7 @@ cdef class NativeFile(_Weakrefable):
         # the passed buffer, so it's hard for us to avoid doubling the memory
         buf = <uint8_t*> malloc(buffer_size)
         if buf == NULL:
-            raise MemoryError("Failed to allocate {0} bytes"
-                              .format(buffer_size))
+            raise MemoryError(f"Failed to allocate {buffer_size} bytes")
 
         writer_thread.start()
 
@@ -771,8 +770,7 @@ cdef class NativeFile(_Weakrefable):
         # the passed buffer, so it's hard for us to avoid doubling the memory
         buf = <uint8_t*> malloc(buffer_size)
         if buf == NULL:
-            raise MemoryError("Failed to allocate {0} bytes"
-                              .format(buffer_size))
+            raise MemoryError(f"Failed to allocate {buffer_size} bytes")
 
         cdef int64_t total_bytes = 0
         cdef int32_t c_buffer_size = buffer_size
@@ -952,7 +950,7 @@ cdef class PythonFile(NativeFile):
         elif inferred_mode.startswith('r'):
             kind = 'r'
         else:
-            raise ValueError('Invalid file mode: {0}'.format(mode))
+            raise ValueError(f'Invalid file mode: {mode}')
 
         # If mode was given, check it matches the given file
         if mode is not None:
@@ -1088,7 +1086,7 @@ cdef class MemoryMappedFile(NativeFile):
             self.is_readable = True
             self.is_writable = True
         else:
-            raise ValueError('Invalid file mode: {0}'.format(mode))
+            raise ValueError(f'Invalid file mode: {mode}')
 
         with nogil:
             handle = GetResultValue(CMemoryMappedFile.Open(c_path, c_mode))
@@ -1150,8 +1148,7 @@ def memory_map(path, mode='r'):
 
 cdef _check_is_file(path):
     if os.path.isdir(path):
-        raise IOError("Expected file path, but {0} is a directory"
-                      .format(path))
+        raise IOError(f"Expected file path, but {path} is a directory")
 
 
 def create_memory_map(path, size):
@@ -1187,6 +1184,12 @@ def create_memory_map(path, size):
 cdef class OSFile(NativeFile):
     """
     A stream backed by a regular file descriptor.
+
+    Parameters
+    ----------
+    path : str or int
+        A file path or an open file descriptor.
+        Passed file descriptors are owned and closed by OSFile.
 
     Examples
     --------
@@ -1233,22 +1236,33 @@ cdef class OSFile(NativeFile):
         object path
 
     def __cinit__(self, path, mode='r', MemoryPool memory_pool=None):
-        _check_is_file(path)
         self.path = path
 
         cdef:
             FileMode c_mode
             shared_ptr[Readable] handle
-            c_string c_path = encode_file_path(path)
+            c_string c_path
+            int fd
 
-        if mode in ('r', 'rb'):
-            self._open_readable(c_path, maybe_unbox_memory_pool(memory_pool))
-        elif mode in ('w', 'wb'):
-            self._open_writable(c_path)
-        elif mode in ('a', 'ab'):
-            self._open_writable(c_path, append=True)
+        if isinstance(path, int):
+            fd = path
+            if mode in ('r', 'rb'):
+                self._open_readable_fd(fd, maybe_unbox_memory_pool(memory_pool))
+            elif mode in ('w', 'wb', 'a', 'ab'):
+                self._open_writable_fd(fd, append=(mode in ('a', 'ab')))
+            else:
+                raise ValueError(f'Invalid file mode: {mode}')
         else:
-            raise ValueError('Invalid file mode: {0}'.format(mode))
+            _check_is_file(path)
+            c_path = encode_file_path(path)
+            if mode in ('r', 'rb'):
+                self._open_readable(c_path, maybe_unbox_memory_pool(memory_pool))
+            elif mode in ('w', 'wb'):
+                self._open_writable(c_path)
+            elif mode in ('a', 'ab'):
+                self._open_writable(c_path, append=True)
+            else:
+                raise ValueError(f'Invalid file mode: {mode}')
 
     cdef _open_readable(self, c_string path, CMemoryPool* pool):
         cdef shared_ptr[ReadableFile] handle
@@ -1267,9 +1281,35 @@ cdef class OSFile(NativeFile):
         self.is_writable = True
         self._is_appending = append
 
+    cdef _open_readable_fd(self, int fd, CMemoryPool* pool):
+        cdef shared_ptr[ReadableFile] handle
+
+        with nogil:
+            handle = GetResultValue(ReadableFile.Open(fd, pool))
+
+        self.is_readable = True
+        self.set_random_access_file(<shared_ptr[CRandomAccessFile]> handle)
+
+    cdef _open_writable_fd(self, int fd, c_bool append=False):
+        with nogil:
+            self.output_stream = GetResultValue(FileOutputStream.Open(fd))
+        self.is_writable = True
+        self._is_appending = append
+
     def fileno(self):
         self._assert_open()
-        return self.handle.file_descriptor()
+        cdef:
+            shared_ptr[ReadableFile] readable_handle
+            shared_ptr[FileOutputStream] writable_handle
+
+        if self.is_readable:
+            readable_handle = static_pointer_cast[ReadableFile, CRandomAccessFile](
+                self.get_random_access_file())
+            return readable_handle.get().file_descriptor()
+        else:
+            writable_handle = static_pointer_cast[FileOutputStream, COutputStream](
+                self.get_output_stream())
+            return writable_handle.get().file_descriptor()
 
 
 cdef class FixedSizeBufferWriter(NativeFile):
@@ -2213,8 +2253,7 @@ cdef get_writer(object source, shared_ptr[COutputStream]* writer):
         nf = source
         writer[0] = nf.get_output_stream()
     else:
-        raise TypeError('Unable to write to object of type: {0}'
-                        .format(type(source)))
+        raise TypeError(f'Unable to write to object of type: {type(source)}')
 
 
 # ---------------------------------------------------------------------
@@ -2249,7 +2288,7 @@ cdef CCompressionType _ensure_compression(str name) except *:
     elif uppercase == 'ZSTD':
         return CCompressionType_ZSTD
     else:
-        raise ValueError('Invalid value for compression: {!r}'.format(name))
+        raise ValueError(f'Invalid value for compression: {name!r}')
 
 
 cdef class CacheOptions(_Weakrefable):
@@ -2370,7 +2409,6 @@ cdef class CacheOptions(_Weakrefable):
             ideal_bandwidth_utilization_frac, max_ideal_request_size_mib))
 
     @staticmethod
-    @binding(True)  # Required for Cython < 3
     def _reconstruct(kwargs):
         # __reduce__ doesn't allow passing named arguments directly to the
         # reconstructor, hence this wrapper.
@@ -2812,8 +2850,8 @@ def input_stream(source, compression='detect', buffer_size=None):
           hasattr(source, 'closed')):
         stream = PythonFile(source, 'r')
     else:
-        raise TypeError("pa.input_stream() called with instance of '{}'"
-                        .format(source.__class__))
+        raise TypeError(
+            f"pa.input_stream() called with instance of '{source.__class__}'")
 
     if compression == 'detect':
         # detect for OSFile too
@@ -2904,8 +2942,8 @@ def output_stream(source, compression='detect', buffer_size=None):
           hasattr(source, 'closed')):
         stream = PythonFile(source, 'w')
     else:
-        raise TypeError("pa.output_stream() called with instance of '{}'"
-                        .format(source.__class__))
+        raise TypeError(
+            f"pa.output_stream() called with instance of '{source.__class__}'")
 
     if compression == 'detect':
         compression = _detect_compression(source_path)

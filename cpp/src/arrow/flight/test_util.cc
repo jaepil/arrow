@@ -25,6 +25,7 @@
 // We need Windows fixes before including Boost
 #include "arrow/util/windows_compatibility.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "arrow/array.h"
@@ -77,6 +78,16 @@ FlightInfo MakeFlightInfo(const Schema& schema, const FlightDescriptor& descript
   return info;
 }
 
+FlightInfo MakeFlightInfo(const FlightDescriptor& descriptor,
+                          const std::vector<FlightEndpoint>& endpoints,
+                          int64_t total_records, int64_t total_bytes, bool ordered,
+                          std::string app_metadata) {
+  EXPECT_OK_AND_ASSIGN(auto info,
+                       FlightInfo::Make(nullptr, descriptor, endpoints, total_records,
+                                        total_bytes, ordered, std::move(app_metadata)));
+  return info;
+}
+
 NumberingStream::NumberingStream(std::unique_ptr<FlightDataStream> stream)
     : counter_(0), stream_(std::move(stream)) {}
 
@@ -93,6 +104,20 @@ arrow::Result<FlightPayload> NumberingStream::Next() {
     counter_++;
   }
   return payload;
+}
+
+void AssertEqual(const FlightInfo& expected, const FlightInfo& actual) {
+  ipc::DictionaryMemo expected_memo;
+  ipc::DictionaryMemo actual_memo;
+  ASSERT_OK_AND_ASSIGN(auto ex_schema, expected.GetSchema(&expected_memo));
+  ASSERT_OK_AND_ASSIGN(auto actual_schema, actual.GetSchema(&actual_memo));
+
+  AssertSchemaEqual(*ex_schema, *actual_schema);
+  ASSERT_EQ(expected.total_records(), actual.total_records());
+  ASSERT_EQ(expected.total_bytes(), actual.total_bytes());
+
+  ASSERT_EQ(expected.descriptor(), actual.descriptor());
+  ASSERT_THAT(actual.endpoints(), ::testing::ContainerEq(expected.endpoints()));
 }
 
 std::shared_ptr<Schema> ExampleIntSchema() {
@@ -240,8 +265,7 @@ std::vector<ActionType> ExampleActionTypes() {
 }
 
 Status ExampleTlsCertificates(std::vector<CertKeyPair>* out) {
-  std::string root;
-  RETURN_NOT_OK(GetTestResourceRoot(&root));
+  ARROW_ASSIGN_OR_RAISE(auto root, GetTestResourceRoot());
 
   *out = std::vector<CertKeyPair>();
   for (int i = 0; i < 2; i++) {
@@ -274,16 +298,11 @@ Status ExampleTlsCertificates(std::vector<CertKeyPair>* out) {
 }
 
 Status ExampleTlsCertificateRoot(CertKeyPair* out) {
-  std::string root;
-  RETURN_NOT_OK(GetTestResourceRoot(&root));
-
-  std::stringstream path;
-  path << root << "/flight/root-ca.pem";
-
+  ARROW_ASSIGN_OR_RAISE(auto path, GetTestResourcePath("flight/root-ca.pem"));
   try {
-    std::ifstream cert_file(path.str());
+    std::ifstream cert_file(path);
     if (!cert_file) {
-      return Status::IOError("Could not open certificate: " + path.str());
+      return Status::IOError("Could not open certificate: " + path);
     }
     std::stringstream cert;
     cert << cert_file.rdbuf();

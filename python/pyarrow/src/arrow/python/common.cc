@@ -122,8 +122,8 @@ class PythonErrorDetail : public StatusDetail {
     PyErr_NormalizeException(&exc_type, &exc_value, &exc_traceback);
     ARROW_CHECK(exc_type)
         << "PythonErrorDetail::FromPyError called without a Python error set";
-    DCHECK(PyType_Check(exc_type));
-    DCHECK(exc_value);  // Ensured by PyErr_NormalizeException, double-check
+    ARROW_DCHECK(PyType_Check(exc_type));
+    ARROW_DCHECK(exc_value);  // Ensured by PyErr_NormalizeException, double-check
     if (exc_traceback == nullptr) {
       // Needed by PyErr_Restore()
       Py_INCREF(Py_None);
@@ -236,7 +236,8 @@ Result<std::shared_ptr<Buffer>> PyBuffer::FromPyObject(PyObject* obj) {
 }
 
 PyBuffer::~PyBuffer() {
-  if (data_ != nullptr) {
+  // GH-38626: destructor may be called after the Python interpreter is finalized.
+  if (Py_IsInitialized() && data_ != nullptr) {
     PyAcquireGIL lock;
     PyBuffer_Release(&py_buf_);
   }

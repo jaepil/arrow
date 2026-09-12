@@ -20,6 +20,7 @@
 #include <cstdint>
 
 #include "arrow/compute/kernels/codegen_internal.h"
+#include "arrow/compute/visibility.h"
 #include "arrow/visit_data_inline.h"
 
 namespace arrow {
@@ -29,7 +30,7 @@ using internal::checked_cast;
 namespace compute {
 namespace internal {
 
-struct ARROW_EXPORT KeyEncoder {
+struct ARROW_COMPUTE_EXPORT KeyEncoder {
   // the first byte of an encoded key is used to indicate nullity
   static constexpr bool kExtraByteForNull = true;
 
@@ -85,7 +86,7 @@ struct ARROW_EXPORT KeyEncoder {
   }
 };
 
-struct ARROW_EXPORT BooleanKeyEncoder : KeyEncoder {
+struct ARROW_COMPUTE_EXPORT BooleanKeyEncoder : KeyEncoder {
   static constexpr int kByteWidth = 1;
 
   void AddLength(const ExecValue& data, int64_t batch_length, int32_t* lengths) override;
@@ -101,7 +102,7 @@ struct ARROW_EXPORT BooleanKeyEncoder : KeyEncoder {
                                             MemoryPool* pool) override;
 };
 
-struct ARROW_EXPORT FixedWidthKeyEncoder : KeyEncoder {
+struct ARROW_COMPUTE_EXPORT FixedWidthKeyEncoder : KeyEncoder {
   explicit FixedWidthKeyEncoder(std::shared_ptr<DataType> type)
       : type_(std::move(type)),
         byte_width_(checked_cast<const FixedWidthType&>(*type_).bit_width() / 8) {}
@@ -122,7 +123,7 @@ struct ARROW_EXPORT FixedWidthKeyEncoder : KeyEncoder {
   const int byte_width_;
 };
 
-struct ARROW_EXPORT DictionaryKeyEncoder : FixedWidthKeyEncoder {
+struct ARROW_COMPUTE_EXPORT DictionaryKeyEncoder : FixedWidthKeyEncoder {
   DictionaryKeyEncoder(std::shared_ptr<DataType> type, MemoryPool* pool)
       : FixedWidthKeyEncoder(std::move(type)), pool_(pool) {}
 
@@ -136,15 +137,22 @@ struct ARROW_EXPORT DictionaryKeyEncoder : FixedWidthKeyEncoder {
   std::shared_ptr<Array> dictionary_;
 };
 
-template <typename T>
-struct VarLengthKeyEncoder : KeyEncoder {
-  using Offset = typename T::offset_type;
+// Shared implementation of the variable-length row encoding used by the plain
+// binary/string encoder and the view encoder. The on-row format is
+// [null byte][length : Offset][raw key bytes]; only Decode differs between the
+// two, so subclasses override just that.
+template <typename VisitType, typename OffsetType>
+struct BaseVarLengthKeyEncoder : KeyEncoder {
+  using Offset = OffsetType;
+
+  explicit BaseVarLengthKeyEncoder(std::shared_ptr<DataType> type)
+      : type_(std::move(type)) {}
 
   void AddLength(const ExecValue& data, int64_t batch_length, int32_t* lengths) override {
     if (data.is_array()) {
       int64_t i = 0;
       ARROW_DCHECK_EQ(data.array.length, batch_length);
-      VisitArraySpanInline<T>(
+      VisitArraySpanInline<VisitType>(
           data.array,
           [&](std::string_view bytes) {
             lengths[i++] +=
@@ -154,8 +162,9 @@ struct VarLengthKeyEncoder : KeyEncoder {
     } else {
       const Scalar& scalar = *data.scalar;
       const int32_t buffer_size =
-          scalar.is_valid ? static_cast<int32_t>(UnboxScalar<T>::Unbox(scalar).size())
-                          : 0;
+          scalar.is_valid
+              ? static_cast<int32_t>(UnboxScalar<VisitType>::Unbox(scalar).size())
+              : 0;
       for (int64_t i = 0; i < batch_length; i++) {
         lengths[i] += kExtraByteForNull + sizeof(Offset) + buffer_size;
       }
@@ -183,9 +192,9 @@ struct VarLengthKeyEncoder : KeyEncoder {
       encoded_ptr += sizeof(Offset);
     };
     if (data.is_array()) {
-      DCHECK_EQ(data.length(), batch_length);
-      VisitArraySpanInline<T>(data.array, handle_next_valid_value,
-                              handle_next_null_value);
+      ARROW_DCHECK_EQ(data.length(), batch_length);
+      VisitArraySpanInline<VisitType>(data.array, handle_next_valid_value,
+                                      handle_next_null_value);
     } else {
       const auto& scalar = data.scalar_as<BaseBinaryScalar>();
       if (scalar.is_valid) {
@@ -209,11 +218,24 @@ struct VarLengthKeyEncoder : KeyEncoder {
     encoded_ptr += sizeof(Offset);
   }
 
+  std::shared_ptr<DataType> type_;
+};
+
+// Encodes plain binary/string keys, decoding back into the aliasable
+// offsets + data buffer layout.
+template <typename T>
+struct VarLengthKeyEncoder : BaseVarLengthKeyEncoder<T, typename T::offset_type> {
+  using Base = BaseVarLengthKeyEncoder<T, typename T::offset_type>;
+  using Base::Base;
+  using Base::type_;
+  using typename Base::Offset;
+
   Result<std::shared_ptr<ArrayData>> Decode(uint8_t** encoded_bytes, int32_t length,
                                             MemoryPool* pool) override {
     std::shared_ptr<Buffer> null_buf;
     int32_t null_count;
-    ARROW_RETURN_NOT_OK(DecodeNulls(pool, length, encoded_bytes, &null_buf, &null_count));
+    ARROW_RETURN_NOT_OK(
+        this->DecodeNulls(pool, length, encoded_bytes, &null_buf, &null_count));
 
     Offset length_sum = 0;
     for (int32_t i = 0; i < length; ++i) {
@@ -245,13 +267,20 @@ struct VarLengthKeyEncoder : KeyEncoder {
         type_, length, {std::move(null_buf), std::move(offset_buf), std::move(key_buf)},
         null_count);
   }
-
-  explicit VarLengthKeyEncoder(std::shared_ptr<DataType> type) : type_(std::move(type)) {}
-
-  std::shared_ptr<DataType> type_;
 };
 
-struct ARROW_EXPORT NullKeyEncoder : KeyEncoder {
+// Encodes BinaryView/StringView keys in the same row format as the plain
+// encoder above. The row copies the key bytes, so Decode builds a fresh view
+// array rather than aliasing the input's variadic buffers.
+struct ARROW_COMPUTE_EXPORT BinaryViewKeyEncoder
+    : BaseVarLengthKeyEncoder<BinaryViewType, int32_t> {
+  using BaseVarLengthKeyEncoder::BaseVarLengthKeyEncoder;
+
+  Result<std::shared_ptr<ArrayData>> Decode(uint8_t** encoded_bytes, int32_t length,
+                                            MemoryPool* pool) override;
+};
+
+struct ARROW_COMPUTE_EXPORT NullKeyEncoder : KeyEncoder {
   void AddLength(const ExecValue&, int64_t batch_length, int32_t* lengths) override {}
 
   void AddLengthNull(int32_t* length) override {}
@@ -331,7 +360,7 @@ struct ARROW_EXPORT NullKeyEncoder : KeyEncoder {
 /// # Row Encoding
 ///
 /// The row format is the concatenation of the encodings of each column.
-class ARROW_EXPORT RowEncoder {
+class ARROW_COMPUTE_EXPORT RowEncoder {
  public:
   static constexpr int kRowIdForNulls() { return -1; }
 

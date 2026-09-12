@@ -20,7 +20,9 @@
 #include <string>
 
 #include "arrow/compute/kernels/scalar_string_internal.h"
+#include "arrow/compute/registry_internal.h"
 #include "arrow/util/config.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/utf8_internal.h"
 
 #ifdef ARROW_WITH_UTF8PROC
@@ -43,7 +45,7 @@ void MakeUnaryStringUTF8TransformKernel(std::string name, FunctionRegistry* regi
                                         FunctionDoc doc) {
   auto func = std::make_shared<ScalarFunction>(name, Arity::Unary(), std::move(doc));
   for (const auto& ty : StringTypes()) {
-    auto exec = GenerateVarBinaryToVarBinary<Transformer>(ty);
+    auto exec = GenerateTypeAgnosticVarBinaryBase<Transformer>(ty);
     DCHECK_OK(func->AddKernel({ty}, ty, std::move(exec)));
   }
   DCHECK_OK(registry->AddFunction(std::move(func)));
@@ -137,9 +139,12 @@ static inline bool IsDecimalCharacterUnicode(uint32_t codepoint) {
 }
 
 static inline bool IsDigitCharacterUnicode(uint32_t codepoint) {
-  // Python defines this as Numeric_Type=Digit or Numeric_Type=Decimal.
-  // utf8proc has no support for this, this is the best we can do:
-  return HasAnyUnicodeGeneralCategory(codepoint, UTF8PROC_CATEGORY_ND);
+  // Approximates Python's str.isnumeric():
+  // returns true for Nd and No (e.g., '٣', '³'), but excludes Nl like Roman numerals
+  // ('Ⅷ') due to utf8proc limits.
+  // '¾' (vulgar fraction) is treated as a digit by utf8proc 'No'
+  return HasAnyUnicodeGeneralCategory(codepoint, UTF8PROC_CATEGORY_ND,
+                                      UTF8PROC_CATEGORY_NO);
 }
 
 static inline bool IsNumericCharacterUnicode(uint32_t codepoint) {
@@ -541,6 +546,16 @@ struct Utf8NormalizeBase {
     }
     if (res < 0) {
       return Status::Invalid("Cannot normalize utf8 string: ", utf8proc_errmsg(res));
+    }
+    if (decompose_options_ & UTF8PROC_COMPOSE) {
+      // utf8proc_decompose() only decomposes; the canonical composition step for
+      // NFC and NFKC is done in-place by utf8proc_normalize_utf32().
+      res = utf8proc_normalize_utf32(
+          reinterpret_cast<utf8proc_int32_t*>(codepoints_.data()), res,
+          decompose_options_);
+      if (res < 0) {
+        return Status::Invalid("Cannot normalize utf8 string: ", utf8proc_errmsg(res));
+      }
     }
     return res;
   }
@@ -986,11 +1001,73 @@ const FunctionDoc utf8_rpad_doc(
      "the given UTF8 codeunit.\nNull values emit null."),
     {"strings"}, "PadOptions", /*options_required=*/true);
 
+struct Utf8ZeroFillTransform : public StringTransformBase {
+  using State = OptionsWrapper<ZeroFillOptions>;
+
+  const ZeroFillOptions& options_;
+
+  explicit Utf8ZeroFillTransform(const ZeroFillOptions& options) : options_(options) {}
+
+  Status PreExec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) override {
+    if (!options_.padding.empty()) {
+      auto str = reinterpret_cast<const uint8_t*>(options_.padding.data());
+      auto strlen = options_.padding.size();
+      if (util::UTF8Length(str, str + strlen) != 1) {
+        return Status::Invalid("Padding must be one codepoint, got '", options_.padding,
+                               "'");
+      }
+    } else {
+      return Status::Invalid("Padding must be one codepoint, got ''");
+    }
+    return Status::OK();
+  }
+
+  int64_t MaxCodeunits(int64_t ninputs, int64_t input_ncodeunits) override {
+    return input_ncodeunits + 4 * ninputs * options_.width;
+  }
+
+  int64_t Transform(const uint8_t* input, int64_t input_string_ncodeunits,
+                    uint8_t* output) {
+    const int64_t input_width = util::UTF8Length(input, input + input_string_ncodeunits);
+    if (input_width >= options_.width) {
+      std::copy(input, input + input_string_ncodeunits, output);
+      return input_string_ncodeunits;
+    }
+    uint8_t* start = output;
+    // sign-aware padding:
+    if (input_string_ncodeunits > 0 && (input[0] == '+' || input[0] == '-')) {
+      *output++ = input[0];
+      input++;
+      input_string_ncodeunits--;
+    }
+    int64_t num_zeros = options_.width - input_width;
+    while (num_zeros > 0) {
+      output = std::copy(options_.padding.begin(), options_.padding.end(), output);
+      num_zeros--;
+    }
+    output = std::copy(input, input + input_string_ncodeunits, output);
+    return output - start;
+  }
+};
+
+template <typename Type>
+using Utf8ZeroFill = StringTransformExecWithState<Type, Utf8ZeroFillTransform>;
+
+const FunctionDoc utf8_zero_fill_doc(
+    "Left-pad strings to a given width, preserving leading sign characters",
+    ("For each string in `strings`, emit a string of length `width` by \n"
+     "prepending the given padding character (defaults to '0' if not specified). \n"
+     "If the string starts with '+' or '-', the sign is preserved and padding \n"
+     "occurs after the sign. Null values emit null."),
+    {"strings"}, "ZeroFillOptions", /*options_required=*/true);
+
 void AddUtf8StringPad(FunctionRegistry* registry) {
   MakeUnaryStringBatchKernelWithState<Utf8LPad>("utf8_lpad", registry, utf8_lpad_doc);
   MakeUnaryStringBatchKernelWithState<Utf8RPad>("utf8_rpad", registry, utf8_rpad_doc);
   MakeUnaryStringBatchKernelWithState<Utf8Center>("utf8_center", registry,
                                                   utf8_center_doc);
+  MakeUnaryStringBatchKernelWithState<Utf8ZeroFill>("utf8_zero_fill", registry,
+                                                    utf8_zero_fill_doc);
 }
 
 // ----------------------------------------------------------------------
@@ -1077,7 +1154,7 @@ void AddUtf8StringReplaceSlice(FunctionRegistry* registry) {
                                                utf8_replace_slice_doc);
 
   for (const auto& ty : StringTypes()) {
-    auto exec = GenerateVarBinaryToVarBinary<Utf8ReplaceSlice>(ty);
+    auto exec = GenerateTypeAgnosticVarBinaryBase<Utf8ReplaceSlice>(ty);
     DCHECK_OK(func->AddKernel({ty}, ty, std::move(exec),
                               ReplaceStringSliceTransformBase::State::Init));
   }
@@ -1273,7 +1350,7 @@ void AddUtf8StringSlice(FunctionRegistry* registry) {
   auto func = std::make_shared<ScalarFunction>("utf8_slice_codeunits", Arity::Unary(),
                                                utf8_slice_codeunits_doc);
   for (const auto& ty : StringTypes()) {
-    auto exec = GenerateVarBinaryToVarBinary<SliceCodeunits>(ty);
+    auto exec = GenerateTypeAgnosticVarBinaryBase<SliceCodeunits>(ty);
     DCHECK_OK(
         func->AddKernel({ty}, ty, std::move(exec), SliceCodeunitsTransform::State::Init));
   }
@@ -1288,7 +1365,8 @@ void AddUtf8StringSlice(FunctionRegistry* registry) {
 struct SplitWhitespaceUtf8Finder : public StringSplitFinderBase<SplitOptions> {
   using Options = SplitOptions;
 
-  Status PreExec(const SplitOptions& options) override {
+  Status PreExec(const SplitOptions& options, bool is_utf8) override {
+    DCHECK(is_utf8);
     EnsureUtf8LookupTablesFilled();
     return Status::OK();
   }
@@ -1359,7 +1437,7 @@ void AddUtf8StringSplitWhitespace(FunctionRegistry* registry) {
       std::make_shared<ScalarFunction>("utf8_split_whitespace", Arity::Unary(),
                                        utf8_split_whitespace_doc, &default_options);
   for (const auto& ty : StringTypes()) {
-    auto exec = GenerateVarBinaryToVarBinary<SplitWhitespaceUtf8Exec, ListType>(ty);
+    auto exec = GenerateTypeAgnosticVarBinaryBase<SplitWhitespaceUtf8Exec, ListType>(ty);
     DCHECK_OK(func->AddKernel({ty}, {list(ty)}, std::move(exec), StringSplitState::Init));
   }
   DCHECK_OK(registry->AddFunction(std::move(func)));

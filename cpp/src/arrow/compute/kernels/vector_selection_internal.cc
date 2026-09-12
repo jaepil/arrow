@@ -39,7 +39,7 @@
 #include "arrow/util/bit_util.h"
 #include "arrow/util/fixed_width_internal.h"
 #include "arrow/util/int_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/ree_util.h"
 
 namespace arrow {
@@ -517,9 +517,9 @@ struct VarBinarySelectionImpl : public Selection<VarBinarySelectionImpl<Type>, T
 
           // Use static property to prune this code from the filter path in
           // optimized builds
-          if (Adapter::is_take &&
-              ARROW_PREDICT_FALSE(static_cast<int64_t>(offset) +
-                                  static_cast<int64_t>(val_size)) > kOffsetLimit) {
+          if (Adapter::is_take && ARROW_PREDICT_FALSE(static_cast<int64_t>(offset) +
+                                                          static_cast<int64_t>(val_size) >
+                                                      kOffsetLimit)) {
             return Status::Invalid("Take operation overflowed binary array capacity");
           }
           offset += val_size;

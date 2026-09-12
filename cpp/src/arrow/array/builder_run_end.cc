@@ -26,7 +26,7 @@
 #include "arrow/scalar.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/int_util_overflow.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/ree_util.h"
 
 namespace arrow {
@@ -213,7 +213,10 @@ Status RunEndEncodedBuilder::AppendScalar(const Scalar& scalar, int64_t n_repeat
 }
 
 Status RunEndEncodedBuilder::AppendScalars(const ScalarVector& scalars) {
-  RETURN_NOT_OK(this->ArrayBuilder::AppendScalars(scalars));
+  if (scalars.empty()) return Status::OK();
+  for (const auto& scalar : scalars) {
+    RETURN_NOT_OK(AppendScalar(*scalar, 1));
+  }
   UpdateDimensions(committed_logical_length_, value_run_builder_->open_run_length());
   return Status::OK();
 }
@@ -289,6 +292,9 @@ Status RunEndEncodedBuilder::FinishInternal(std::shared_ptr<ArrayData>* out) {
   ARROW_ASSIGN_OR_RAISE(auto ree_array,
                         RunEndEncodedArray::Make(length_, run_ends_array, values_array));
   *out = std::move(ree_array->data());
+
+  Reset();
+
   return Status::OK();
 }
 

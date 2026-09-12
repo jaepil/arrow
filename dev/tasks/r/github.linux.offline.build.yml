@@ -19,15 +19,20 @@
 
 {{ macros.github_header() }}
 
+permissions:
+  contents: read
+  # For OIDC token for sccache
+  id-token: write
+
 jobs:
   grab-dependencies:
     name: "Download thirdparty dependencies"
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
     env:
       ARROW_R_DEV: "TRUE"
-      RSPM: "https://packagemanager.rstudio.com/cran/__linux__/focal/latest"
+      RSPM: "https://packagemanager.rstudio.com/cran/__linux__/jammy/latest"
     steps:
       {{ macros.github_checkout_arrow()|indent }}
 
@@ -49,12 +54,12 @@ jobs:
   install-offline:
     name: "Install offline"
     needs: [grab-dependencies]
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
     env:
       ARROW_R_DEV: TRUE
-      RSPM: "https://packagemanager.rstudio.com/cran/__linux__/focal/latest"
+      RSPM: "https://packagemanager.rstudio.com/cran/__linux__/jammy/latest"
     steps:
       {{ macros.github_checkout_arrow()|indent }}
 
@@ -77,6 +82,7 @@ jobs:
           install.packages(c("remotes", "glue", "sys"))
           remotes::install_deps("arrow/r", dependencies = TRUE)
         shell: Rscript {0}
+      {{ macros.github_configure_aws_credentials()|indent }}
       - name: Install
         env:
           ARROW_OFFLINE_BUILD: true

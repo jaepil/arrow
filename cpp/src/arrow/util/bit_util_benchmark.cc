@@ -42,8 +42,7 @@
 #include "arrow/util/bitmap_visit.h"
 #include "arrow/util/bitmap_writer.h"
 
-namespace arrow {
-namespace bit_util {
+namespace arrow::bit_util::benchmarks {
 
 constexpr int64_t kBufferSize = 1024 * 8;
 
@@ -435,7 +434,18 @@ static void SetBitsTo(benchmark::State& state) {
   std::shared_ptr<Buffer> buffer = CreateRandomBuffer(nbytes);
 
   for (auto _ : state) {
-    bit_util::SetBitsTo(buffer->mutable_data(), /*offset=*/0, nbytes * 8, true);
+    ::arrow::bit_util::SetBitsTo(buffer->mutable_data(), /*offset=*/0, nbytes * 8, true);
+  }
+  state.SetBytesProcessed(state.iterations() * nbytes);
+}
+
+static void CountSetBits(benchmark::State& state) {
+  int64_t nbytes = state.range(0);
+  std::shared_ptr<Buffer> buffer = CreateRandomBuffer(nbytes);
+
+  for (auto _ : state) {
+    auto count = internal::CountSetBits(buffer->data(), /*bit_offset=*/0, nbytes * 8);
+    benchmark::DoNotOptimize(count);
   }
   state.SetBytesProcessed(state.iterations() * nbytes);
 }
@@ -520,6 +530,7 @@ BENCHMARK(ReverseSetBitRunReader)->Apply(SetBitRunReaderPercentageArg);
 BENCHMARK(VisitBits)->Arg(kBufferSize);
 BENCHMARK(VisitBitsUnrolled)->Arg(kBufferSize);
 BENCHMARK(SetBitsTo)->Arg(2)->Arg(1 << 4)->Arg(1 << 10)->Arg(1 << 17);
+BENCHMARK(CountSetBits)->Arg(1 << 4)->Arg(1 << 10)->Arg(1 << 17);
 
 #ifdef ARROW_WITH_BENCHMARKS_REFERENCE
 static void ReferenceNaiveBitmapWriter(benchmark::State& state) {
@@ -551,5 +562,4 @@ BENCHMARK(BenchmarkBitmapVisitBitsetAnd)->Ranges(AND_BENCHMARK_RANGES);
 BENCHMARK(BenchmarkBitmapVisitUInt8And)->Ranges(AND_BENCHMARK_RANGES);
 BENCHMARK(BenchmarkBitmapVisitUInt64And)->Ranges(AND_BENCHMARK_RANGES);
 
-}  // namespace bit_util
-}  // namespace arrow
+}  // namespace arrow::bit_util::benchmarks

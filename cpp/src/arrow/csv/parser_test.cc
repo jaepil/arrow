@@ -17,7 +17,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -89,7 +91,9 @@ void GetColumn(const BlockParser& parser, int32_t col_index,
                std::vector<std::string>* out, std::vector<bool>* out_quoted = nullptr) {
   std::vector<std::string> values;
   std::vector<bool> quoted_values;
-  auto visit = [&](const uint8_t* data, uint32_t size, bool quoted) -> Status {
+  auto visit = [&](const uint8_t* data, uint32_t size, bool quoted,
+                   bool missing) -> Status {
+    EXPECT_FALSE(missing);
     values.push_back(std::string(reinterpret_cast<const char*>(data), size));
     if (out_quoted) {
       quoted_values.push_back(quoted);
@@ -107,7 +111,9 @@ void GetLastRow(const BlockParser& parser, std::vector<std::string>* out,
                 std::vector<bool>* out_quoted = nullptr) {
   std::vector<std::string> values;
   std::vector<bool> quoted_values;
-  auto visit = [&](const uint8_t* data, uint32_t size, bool quoted) -> Status {
+  auto visit = [&](const uint8_t* data, uint32_t size, bool quoted,
+                   bool missing) -> Status {
+    EXPECT_FALSE(missing);
     values.push_back(std::string(reinterpret_cast<const char*>(data), size));
     if (out_quoted) {
       quoted_values.push_back(quoted);
@@ -260,6 +266,69 @@ TEST(BlockParser, Basics) {
     AssertColumnsEq(parser, {{"ab", "ef", ""}, {"cd", "", "ij"}, {"", "gh", "kl"}});
     AssertLastRowEq(parser, {"", "ij", "kl"}, {false, false, false});
   }
+}
+
+TEST(BlockParser, PadShortRows) {
+  auto options = ParseOptions::Defaults();
+  options.pad_short_rows = true;
+
+  BlockParser parser(options, /*num_cols=*/3);
+  AssertParseOk(parser, "1,2\n3,4,5\n");
+  AssertColumnEq(parser, 0, {"1", "3"});
+  AssertColumnEq(parser, 1, {"2", "4"});
+  std::vector<std::string> values;
+  std::vector<bool> missing;
+  ASSERT_OK(parser.VisitColumn(
+      2, [&](const uint8_t* data, uint32_t size, bool, bool is_missing) -> Status {
+        values.emplace_back(reinterpret_cast<const char*>(data), size);
+        missing.push_back(is_missing);
+        return Status::OK();
+      }));
+  ASSERT_EQ(values, std::vector<std::string>({"", "5"}));
+  ASSERT_EQ(missing, std::vector<bool>({true, false}));
+
+  BlockParser last_row_parser(options, /*num_cols=*/3);
+  AssertParseOk(last_row_parser, "1,2\n");
+  std::vector<bool> last_row_missing;
+  ASSERT_OK(last_row_parser.VisitLastRow(
+      [&](const uint8_t*, uint32_t, bool, bool is_missing) -> Status {
+        last_row_missing.push_back(is_missing);
+        return Status::OK();
+      }));
+  ASSERT_EQ(last_row_missing, std::vector<bool>({false, false, true}));
+}
+
+TEST(BlockParser, IgnoreExtraColumns) {
+  auto options = ParseOptions::Defaults();
+  options.ignore_extra_columns = true;
+
+  BlockParser parser(options, /*num_cols=*/2);
+  AssertParseOk(parser, "a,\"b\",c,\nd,e\n");
+  AssertColumnsEq(parser, {{"a", "d"}, {"b", "e"}}, {{false, false}, {true, false}});
+
+  BlockParser final_parser(options, /*num_cols=*/2);
+  AssertParseFinal(final_parser, "a,b,");
+  AssertColumnsEq(final_parser, {{"a"}, {"b"}});
+}
+
+TEST(BlockParser, PadAndIgnore) {
+  auto options = ParseOptions::Defaults();
+  options.pad_short_rows = true;
+  options.ignore_extra_columns = true;
+
+  BlockParser parser(options, /*num_cols=*/2);
+  AssertParseFinal(parser, "a,b,c\nd");
+  AssertColumnEq(parser, 0, {"a", "d"});
+  std::vector<std::string> values;
+  std::vector<bool> missing;
+  ASSERT_OK(parser.VisitColumn(
+      1, [&](const uint8_t* data, uint32_t size, bool, bool is_missing) -> Status {
+        values.emplace_back(reinterpret_cast<const char*>(data), size);
+        missing.push_back(is_missing);
+        return Status::OK();
+      }));
+  ASSERT_EQ(values, std::vector<std::string>({"b", ""}));
+  ASSERT_EQ(missing, std::vector<bool>({false, true}));
 }
 
 TEST(BlockParser, EmptyHeader) {
@@ -586,6 +655,28 @@ TEST(BlockParser, QuotesSpecial) {
   }
 }
 
+std::vector<std::string> MismatchingNumColumns(int32_t num_cols, int32_t mismatch,
+                                               int64_t extra_lines = 0) {
+  auto write_line = [](int32_t num_cols, std::string_view prefix, std::ostream* out) {
+    for (int32_t i = 0; i < num_cols; ++i) {
+      *out << prefix << i << ",";
+    }
+    out->seekp(-1, std::ios_base::cur);
+    *out << "\n";
+  };
+
+  std::stringstream csv_data;
+  // Output first line with `num_cols` columns
+  write_line(num_cols, "a", &csv_data);
+  // Output second line with mismatching number of columns
+  write_line(num_cols + mismatch, "b", &csv_data);
+  // Output extra lines with `num_cols` columns each
+  for (int64_t i = 0; i < extra_lines; ++i) {
+    write_line(num_cols, "c", &csv_data);
+  }
+  return {csv_data.str()};
+}
+
 TEST(BlockParser, MismatchingNumColumns) {
   uint32_t out_size;
   {
@@ -621,6 +712,36 @@ TEST(BlockParser, MismatchingNumColumns) {
     EXPECT_RAISES_WITH_MESSAGE_THAT(
         Invalid, testing::HasSubstr("CSV parse error: Expected 2 columns, got 1: a"), st);
   }
+  // Vary the number of columns and mismatch, to catch buffer overflow issues
+  for (int32_t num_cols : {1, 2, 5, 100}) {
+    ARROW_SCOPED_TRACE("num_cols = ", num_cols);
+    for (int32_t mismatch : {-5, -1, 1, 5, 10, 50, 1024, 32767}) {
+      if (mismatch + num_cols <= 0) {
+        continue;
+      }
+      ARROW_SCOPED_TRACE("mismatch = ", mismatch);
+      // Try to parse CSV data
+      auto csv_data = MismatchingNumColumns(num_cols, mismatch);
+      BlockParser parser(ParseOptions::Defaults(), num_cols, /*first_row=*/1);
+      Status st = Parse(parser, MakeCSVData(csv_data), &out_size);
+      std::stringstream expected_error;
+      expected_error << "Row #2: Expected " << num_cols << " columns, got "
+                     << num_cols + mismatch << ":";
+      EXPECT_RAISES_WITH_MESSAGE_THAT(Invalid, testing::HasSubstr(expected_error.str()),
+                                      st);
+    }
+  }
+}
+
+TEST(BlockParser, TooManyValues) {
+  // A first line carrying millions of fields drives num_cols high enough that
+  // the per-chunk value count (rows x columns) would overflow the 31-bit value
+  // offset, so the parser errors out instead of overflowing.
+  uint32_t out_size;
+  BlockParser parser(ParseOptions::Defaults(), /*num_cols=*/5000000);
+  Status st = Parse(parser, MakeCSVData({"a,b\n"}), &out_size);
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, testing::HasSubstr("exceeds the maximum number of values"), st);
 }
 
 TEST(BlockParser, MismatchingNumColumnsHandler) {
@@ -724,6 +845,35 @@ TEST(BlockParser, MismatchingNumColumnsHandler) {
 
     ASSERT_NO_FATAL_FAILURE(AssertLastRowEq(parser, {"j", "k"}, {false, false}));
   }
+
+  // Vary the number of columns and mismatch, to catch buffer overflow issues
+  for (int32_t num_cols : {1, 2, 5, 100}) {
+    ARROW_SCOPED_TRACE("num_cols = ", num_cols);
+    for (int32_t mismatch : {-5, -1, 1, 5, 10, 50, 1024, 32767}) {
+      if (mismatch + num_cols <= 0) {
+        continue;
+      }
+      ARROW_SCOPED_TRACE("mismatch = ", mismatch);
+      // Parse CSV data
+      auto csv_data = MismatchingNumColumns(num_cols, mismatch, /*extra_lines=*/1);
+      ParseOptions opts = ParseOptions::Defaults();
+      CustomHandler handler;
+      opts.invalid_row_handler = handler;
+      BlockParser parser(opts, num_cols, /*first_row=*/1);
+      ASSERT_NO_FATAL_FAILURE(AssertParseOk(parser, MakeCSVData(csv_data)));
+      ASSERT_EQ(2, parser.num_rows());
+      ASSERT_EQ(3, parser.total_num_rows());
+      ASSERT_EQ(1, handler.rows.size());
+      const auto& invalid_row = handler.rows[0];
+      ASSERT_EQ(num_cols, invalid_row.first.expected_columns);
+      ASSERT_EQ(num_cols + mismatch, invalid_row.first.actual_columns);
+      ASSERT_EQ("b0", invalid_row.second.substr(0, 2));
+      std::vector<std::string> last_row;
+      GetLastRow(parser, &last_row);
+      ASSERT_EQ(last_row.front(), "c0");
+      ASSERT_EQ(last_row.back(), "c" + std::to_string(num_cols - 1));
+    }
+  }
 }
 
 TEST(BlockParser, Escaping) {
@@ -801,10 +951,12 @@ TEST(BlockParser, RowNumberAppendedToError) {
     BlockParser parser(options, -1, 0);
     ASSERT_NO_FATAL_FAILURE(AssertParseOk(parser, csv));
     int row = 0;
-    auto status = parser.VisitColumn(
-        0, [row](const uint8_t* data, uint32_t size, bool quoted) mutable -> Status {
-          return ++row == 2 ? Status::Invalid("Bad value") : Status::OK();
-        });
+    auto status = parser.VisitColumn(0,
+                                     [row](const uint8_t* data, uint32_t size,
+                                           bool quoted, bool missing) mutable -> Status {
+                                       return ++row == 2 ? Status::Invalid("Bad value")
+                                                         : Status::OK();
+                                     });
     EXPECT_RAISES_WITH_MESSAGE_THAT(Invalid, testing::HasSubstr("Row #1: Bad value"),
                                     status);
   }
@@ -813,10 +965,12 @@ TEST(BlockParser, RowNumberAppendedToError) {
     BlockParser parser(options, -1, 100);
     ASSERT_NO_FATAL_FAILURE(AssertParseOk(parser, csv));
     int row = 0;
-    auto status = parser.VisitColumn(
-        0, [row](const uint8_t* data, uint32_t size, bool quoted) mutable -> Status {
-          return ++row == 3 ? Status::Invalid("Bad value") : Status::OK();
-        });
+    auto status = parser.VisitColumn(0,
+                                     [row](const uint8_t* data, uint32_t size,
+                                           bool quoted, bool missing) mutable -> Status {
+                                       return ++row == 3 ? Status::Invalid("Bad value")
+                                                         : Status::OK();
+                                     });
     EXPECT_RAISES_WITH_MESSAGE_THAT(Invalid, testing::HasSubstr("Row #102: Bad value"),
                                     status);
   }
@@ -826,10 +980,12 @@ TEST(BlockParser, RowNumberAppendedToError) {
     BlockParser parser(options, -1, -1);
     ASSERT_NO_FATAL_FAILURE(AssertParseOk(parser, csv));
     int row = 0;
-    auto status = parser.VisitColumn(
-        0, [row](const uint8_t* data, uint32_t size, bool quoted) mutable -> Status {
-          return ++row == 3 ? Status::Invalid("Bad value") : Status::OK();
-        });
+    auto status = parser.VisitColumn(0,
+                                     [row](const uint8_t* data, uint32_t size,
+                                           bool quoted, bool missing) mutable -> Status {
+                                       return ++row == 3 ? Status::Invalid("Bad value")
+                                                         : Status::OK();
+                                     });
     EXPECT_RAISES_WITH_MESSAGE_THAT(Invalid, testing::Not(testing::HasSubstr("Row")),
                                     status);
   }
@@ -843,13 +999,59 @@ TEST(BlockParser, RowNumberAppendedToError) {
     BlockParser parser(opts, /*num_cols=*/2, /*first_row=*/1);
     ASSERT_NO_FATAL_FAILURE(AssertParseOk(parser, "a,b,c\nd,e\nf,g\nh\ni\nj,k\nl\n"));
     int row = 0;
-    auto status = parser.VisitColumn(
-        0, [row](const uint8_t* data, uint32_t size, bool quoted) mutable -> Status {
-          return ++row == 3 ? Status::Invalid("Bad value") : Status::OK();
-        });
+    auto status = parser.VisitColumn(0,
+                                     [row](const uint8_t* data, uint32_t size,
+                                           bool quoted, bool missing) mutable -> Status {
+                                       return ++row == 3 ? Status::Invalid("Bad value")
+                                                         : Status::OK();
+                                     });
 
     EXPECT_RAISES_WITH_MESSAGE_THAT(Invalid, testing::HasSubstr("Row #6: Bad value"),
                                     status);
+  }
+}
+
+TEST(BlockParser, EmbeddedNulBytesDisableBulkFilter) {
+  // Regression test for GH-50481: disables the bulk filter for any block
+  // with an embedded NUL, so every cell here carries one.
+  constexpr int32_t num_cols = 64;
+  // 4x the ~512-row ParseChunk cap for num_cols == 64, so the filler block
+  // spans multiple calls even if that internal constant changes.
+  constexpr int32_t num_filler_rows = 4 * 512;
+
+  // 12 bytes/value, above the bulk filter's activation threshold.
+  std::string filler_cell = "xxxxxxxxxxx";
+  filler_cell += '\0';
+
+  std::string csv;
+  for (int32_t r = 0; r < num_filler_rows; ++r) {
+    for (int32_t c = 0; c < num_cols; ++c) {
+      if (c) csv += ',';
+      csv += filler_cell;
+    }
+    csv += '\n';
+  }
+  // NUL right before the closing quote: the misaligned-SIMD-scan trigger.
+  csv += "\"abc";
+  csv += '\0';
+  csv += "def\"";
+  for (int32_t c = 1; c < num_cols; ++c) {
+    csv += ',';
+    csv += filler_cell;
+  }
+  csv += '\n';
+
+  BlockParser parser(ParseOptions::Defaults(), num_cols, /*first_row=*/0);
+  AssertParseFinal(parser, csv);
+  ASSERT_EQ(parser.num_rows(), num_filler_rows + 1);
+
+  std::vector<std::string> last_row;
+  GetLastRow(parser, &last_row);
+  ASSERT_EQ(last_row.size(), static_cast<size_t>(num_cols));
+  ASSERT_EQ(last_row[0], std::string("abc\0def", 7));
+  // Other NUL-bearing fields in the row must come through unmangled too.
+  for (size_t c = 1; c < last_row.size(); ++c) {
+    ASSERT_EQ(last_row[c], filler_cell) << "column " << c;
   }
 }
 

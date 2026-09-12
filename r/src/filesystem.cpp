@@ -37,9 +37,9 @@ const char* r6_class_name<fs::FileSystem>::get(
     return "S3FileSystem";
   } else if (type_name == "gcs") {
     return "GcsFileSystem";
+  } else if (type_name == "abfs") {
+    return "AzureFileSystem";
     // Uncomment these once R6 classes for these filesystems are added
-    // } else if (type_name == "abfs") {
-    //   return "AzureBlobFileSystem";
     // } else if (type_name == "hdfs") {
     //   return "HadoopFileSystem";
   } else if (type_name == "subtree") {
@@ -256,9 +256,22 @@ std::string fs___SubTreeFileSystem__base_path(
   return file_system->base_path();
 }
 
+// Forward declaration - defined in the ARROW_R_WITH_S3 block below.
+#if defined(ARROW_R_WITH_S3)
+void EnsureS3InitializedWithSigpipeHandler();
+#endif
+
 // [[arrow::export]]
 cpp11::writable::list fs___FileSystemFromUri(const std::string& path) {
-  using cpp11::literals::operator"" _nm;
+  using cpp11::literals::operator""_nm;
+
+#if defined(ARROW_R_WITH_S3)
+  // Initialize S3 before FileSystemFromUri so our options (with SIGPIPE handler)
+  // take effect before the C++ library's internal EnsureS3Initialized() call.
+  if (path.substr(0, 5) == "s3://") {
+    EnsureS3InitializedWithSigpipeHandler();
+  }
+#endif
 
   std::string out_path;
   auto io_context = MainRThread::GetInstance().CancellableIOContext();
@@ -281,6 +294,20 @@ void fs___CopyFiles(const std::shared_ptr<fs::FileSystem>& source_fs,
 
 #include <arrow/filesystem/s3fs.h>
 
+// Initialize S3 with the SIGPIPE handler enabled. Without it, stale connections
+// in the SDK's connection pool can trigger SIGPIPE during Aws::ShutdownAPI(),
+// which causes R's signal handler to longjmp out of the teardown and segfault
+// (GH-50009, GH-32026).
+void EnsureS3InitializedWithSigpipeHandler() {
+  fs::S3GlobalOptions options = fs::S3GlobalOptions::Defaults();
+  options.install_sigpipe_handler = true;
+  auto status = fs::InitializeS3(options);
+  // InitializeS3 returns Invalid if already initialized - that's fine
+  if (!status.ok() && !fs::IsS3Initialized()) {
+    StopIfNotOk(status);
+  }
+}
+
 // [[s3::export]]
 std::shared_ptr<fs::S3FileSystem> fs___S3FileSystem__create(
     bool anonymous = false, std::string access_key = "", std::string secret_key = "",
@@ -289,10 +316,9 @@ std::shared_ptr<fs::S3FileSystem> fs___S3FileSystem__create(
     std::string region = "", std::string endpoint_override = "", std::string scheme = "",
     std::string proxy_options = "", bool background_writes = true,
     bool allow_bucket_creation = false, bool allow_bucket_deletion = false,
-    double connect_timeout = -1, double request_timeout = -1) {
-  // We need to ensure that S3 is initialized before we start messing with the
-  // options
-  StopIfNotOk(fs::EnsureS3Initialized());
+    bool check_directory_existence_before_creation = false, double connect_timeout = -1,
+    double request_timeout = -1) {
+  EnsureS3InitializedWithSigpipeHandler();
   fs::S3Options s3_opts;
   // Handle auth (anonymous, keys, default)
   // (validation/internal coherence handled in R)
@@ -330,6 +356,9 @@ std::shared_ptr<fs::S3FileSystem> fs___S3FileSystem__create(
 
   s3_opts.allow_bucket_creation = allow_bucket_creation;
   s3_opts.allow_bucket_deletion = allow_bucket_deletion;
+
+  s3_opts.check_directory_existence_before_creation =
+      check_directory_existence_before_creation;
 
   s3_opts.request_timeout = request_timeout;
   s3_opts.connect_timeout = connect_timeout;
@@ -429,16 +458,12 @@ std::shared_ptr<fs::GcsFileSystem> fs___GcsFileSystem__Make(bool anonymous,
   }
 
   auto io_context = MainRThread::GetInstance().CancellableIOContext();
-#if ARROW_VERSION_MAJOR >= 18
   return ValueOrStop(fs::GcsFileSystem::Make(gcs_opts, io_context));
-#else
-  return fs::GcsFileSystem::Make(gcs_opts, io_context);
-#endif
 }
 
 // [[gcs::export]]
 cpp11::list fs___GcsFileSystem__options(const std::shared_ptr<fs::GcsFileSystem>& fs) {
-  using cpp11::literals::operator"" _nm;
+  using cpp11::literals::operator""_nm;
 
   cpp11::writable::list out;
 
@@ -498,6 +523,59 @@ cpp11::list fs___GcsFileSystem__options(const std::shared_ptr<fs::GcsFileSystem>
   }
 
   return out;
+}
+
+#endif
+
+#if defined(ARROW_R_WITH_AZURE)
+#include <arrow/filesystem/azurefs.h>
+
+// [[azure::export]]
+std::shared_ptr<fs::AzureFileSystem> fs___AzureFileSystem__Make(cpp11::list options) {
+  fs::AzureOptions azure_opts;
+
+  // Set account name
+  azure_opts.account_name = cpp11::as_cpp<std::string>(options["account_name"]);
+
+  if (!Rf_isNull(options["blob_storage_authority"])) {
+    azure_opts.blob_storage_authority =
+        cpp11::as_cpp<std::string>(options["blob_storage_authority"]);
+  }
+  if (!Rf_isNull(options["dfs_storage_authority"])) {
+    azure_opts.dfs_storage_authority =
+        cpp11::as_cpp<std::string>(options["dfs_storage_authority"]);
+  }
+  if (!Rf_isNull(options["blob_storage_scheme"])) {
+    azure_opts.blob_storage_scheme =
+        cpp11::as_cpp<std::string>(options["blob_storage_scheme"]);
+  }
+  if (!Rf_isNull(options["dfs_storage_scheme"])) {
+    azure_opts.dfs_storage_scheme =
+        cpp11::as_cpp<std::string>(options["dfs_storage_scheme"]);
+  }
+  // Validation of the different auth paths happens in the R code.
+  if (!Rf_isNull(options["client_id"])) {
+    if (Rf_isNull(options["tenant_id"]) && Rf_isNull(options["client_secret"])) {
+      StopIfNotOk(azure_opts.ConfigureManagedIdentityCredential(
+          cpp11::as_cpp<std::string>(options["client_id"])));
+    } else if (!Rf_isNull(options["tenant_id"]) && !Rf_isNull(options["client_secret"])) {
+      StopIfNotOk(azure_opts.ConfigureClientSecretCredential(
+          cpp11::as_cpp<std::string>(options["tenant_id"]),
+          cpp11::as_cpp<std::string>(options["client_id"]),
+          cpp11::as_cpp<std::string>(options["client_secret"])));
+    }
+  } else if (!Rf_isNull(options["account_key"])) {
+    StopIfNotOk(azure_opts.ConfigureAccountKeyCredential(
+        cpp11::as_cpp<std::string>(options["account_key"])));
+  } else if (!Rf_isNull(options["sas_token"])) {
+    StopIfNotOk(azure_opts.ConfigureSASCredential(
+        cpp11::as_cpp<std::string>(options["sas_token"])));
+  } else {
+    StopIfNotOk(azure_opts.ConfigureDefaultCredential());
+  }
+
+  auto io_context = MainRThread::GetInstance().CancellableIOContext();
+  return ValueOrStop(fs::AzureFileSystem::Make(azure_opts, io_context));
 }
 
 #endif

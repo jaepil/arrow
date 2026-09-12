@@ -24,7 +24,7 @@
 #include "arrow/datum.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/type_fwd.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/ree_util.h"
 
 namespace arrow {
@@ -356,6 +356,13 @@ std::vector<REETestData> GenerateTestData() {
       REETestData::TypeMinMaxNull<UInt64Type>(),
       REETestData::TypeMinMaxNull<FloatType>(),
       REETestData::TypeMinMaxNull<DoubleType>(),
+      // Float types
+      REETestData::JSON(float16(), "[1, 1, 0, -5, -5, -5, 255, 255]", "[1, 0, -5, 255]",
+                        "[2, 3, 6, 8]"),
+      REETestData::JSON(float32(), "[1, 1, 0, -5, -5, -5, 255, 255]", "[1, 0, -5, 255]",
+                        "[2, 3, 6, 8]"),
+      REETestData::JSON(float64(), "[1, 1, 0, -5, -5, -5, 255, 255]", "[1, 0, -5, 255]",
+                        "[2, 3, 6, 8]"),
       // A few temporal types
       REETestData::JSON(date32(),
                         "[86400, 86400, 0, 432000, 432000, 432000, 22075200, 22075200]",
@@ -369,6 +376,12 @@ std::vector<REETestData> GenerateTestData() {
       REETestData::JSON(time64(TimeUnit::MICRO), "[1, 1, 0, 5, 5, 5, 255, 255]",
                         "[1, 0, 5, 255]", "[2, 3, 6, 8]"),
       // Decimal and fixed size binary types
+      REETestData::JSON(decimal32(4, 1),
+                        R"(["1.0", "1.0", "0.0", "5.2", "5.2", "5.2", "255.0", "255.0"])",
+                        R"(["1.0", "0.0", "5.2", "255.0"])", "[2, 3, 6, 8]"),
+      REETestData::JSON(decimal64(4, 1),
+                        R"(["1.0", "1.0", "0.0", "5.2", "5.2", "5.2", "255.0", "255.0"])",
+                        R"(["1.0", "0.0", "5.2", "255.0"])", "[2, 3, 6, 8]"),
       REETestData::JSON(decimal128(4, 1),
                         R"(["1.0", "1.0", "0.0", "5.2", "5.2", "5.2", "255.0", "255.0"])",
                         R"(["1.0", "0.0", "5.2", "255.0"])", "[2, 3, 6, 8]"),
@@ -399,6 +412,221 @@ INSTANTIATE_TEST_SUITE_P(EncodeArrayTests, TestRunEndEncodeDecode,
                          ::testing::Combine(::testing::ValuesIn(GenerateTestData()),
                                             ::testing::Values(int16(), int32(),
                                                               int64())));
+
+void AssertNestedRunEndEncodeDecode(const std::shared_ptr<Array>& input,
+                                    const std::string& expected_run_ends_json,
+                                    const std::shared_ptr<Array>& expected_values) {
+  for (const auto& run_end_type : {int16(), int32(), int64()}) {
+    ARROW_SCOPED_TRACE("run end type = ", *run_end_type);
+    ASSERT_OK_AND_ASSIGN(Datum encoded_datum,
+                         RunEndEncode(input, RunEndEncodeOptions{run_end_type}));
+    auto encoded =
+        std::dynamic_pointer_cast<RunEndEncodedArray>(encoded_datum.make_array());
+
+    ASSERT_NE(encoded, NULLPTR);
+    ASSERT_OK(encoded->ValidateFull());
+    ASSERT_EQ(encoded->length(), input->length());
+    ASSERT_EQ(*encoded->type(), *run_end_encoded(run_end_type, input->type()));
+    ASSERT_ARRAYS_EQUAL(*encoded->run_ends(),
+                        *ArrayFromJSON(run_end_type, expected_run_ends_json));
+    ASSERT_ARRAYS_EQUAL(*encoded->values(), *expected_values);
+
+    ASSERT_OK_AND_ASSIGN(Datum decoded_datum, RunEndDecode(encoded));
+    auto decoded = decoded_datum.make_array();
+    ASSERT_OK(decoded->ValidateFull());
+    ASSERT_ARRAYS_EQUAL(*decoded, *input);
+
+    if (input->length() > 0) {
+      ASSERT_OK_AND_ASSIGN(Datum decoded_slice_datum, RunEndDecode(encoded->Slice(1)));
+      auto decoded_slice = decoded_slice_datum.make_array();
+      ASSERT_OK(decoded_slice->ValidateFull());
+      ASSERT_ARRAYS_EQUAL(*decoded_slice, *input->Slice(1));
+
+      ASSERT_OK_AND_ASSIGN(Datum decoded_prefix_datum,
+                           RunEndDecode(encoded->Slice(0, encoded->length() - 1)));
+      auto decoded_prefix = decoded_prefix_datum.make_array();
+      ASSERT_OK(decoded_prefix->ValidateFull());
+      ASSERT_ARRAYS_EQUAL(*decoded_prefix, *input->Slice(0, input->length() - 1));
+    }
+  }
+}
+
+TEST(TestRunEndEncodeDecodeNested, VariableSizeList) {
+  auto value_type = list(int32());
+  auto input = ArrayFromJSON(value_type, R"([
+      [9], [1, 2], [1, 2], [], [], null, null, [null], [null], [3], [3], [4], [9]
+  ])");
+  input = input->Slice(1, 11);
+  auto expected_values =
+      ArrayFromJSON(value_type, R"([[1, 2], [], null, [null], [3], [4]])");
+  AssertNestedRunEndEncodeDecode(input, "[2, 4, 6, 8, 10, 11]", expected_values);
+
+  AssertNestedRunEndEncodeDecode(ArrayFromJSON(value_type, "[]"), "[]",
+                                 ArrayFromJSON(value_type, "[]"));
+
+  auto signed_zeros = ArrayFromJSON(list(float64()), "[[0.0], [-0.0]]");
+  AssertNestedRunEndEncodeDecode(signed_zeros, "[1, 2]", signed_zeros);
+
+  auto null_lists = ArrayFromJSON(list(null()), "[[null], [null], [], [null]]");
+  auto expected_null_lists = ArrayFromJSON(list(null()), "[[null], [], [null]]");
+  AssertNestedRunEndEncodeDecode(null_lists, "[2, 3, 4]", expected_null_lists);
+
+  auto nested_value_type = list(list(int32()));
+  auto nested_lists =
+      ArrayFromJSON(nested_value_type, "[[[1], [2]], [[1], [2]], [], null, [[3, null]]]");
+  auto expected_nested_lists =
+      ArrayFromJSON(nested_value_type, "[[[1], [2]], [], null, [[3, null]]]");
+  AssertNestedRunEndEncodeDecode(nested_lists, "[2, 3, 4, 5]", expected_nested_lists);
+}
+
+TEST(TestRunEndEncodeDecodeNested, LargeList) {
+  auto value_type = large_list(int32());
+  auto input = ArrayFromJSON(value_type, R"([
+      [9], [1, 2], [1, 2], [], [], null, null, [null], [null], [3], [3], [4], [9]
+  ])");
+  input = input->Slice(1, 11);
+  auto expected_values =
+      ArrayFromJSON(value_type, R"([[1, 2], [], null, [null], [3], [4]])");
+  AssertNestedRunEndEncodeDecode(input, "[2, 4, 6, 8, 10, 11]", expected_values);
+
+  AssertNestedRunEndEncodeDecode(ArrayFromJSON(value_type, "[]"), "[]",
+                                 ArrayFromJSON(value_type, "[]"));
+}
+
+template <typename ListViewArrayType>
+void AssertListViewRunEndEncodeDecode(const std::shared_ptr<DataType>& offset_type,
+                                      const std::shared_ptr<DataType>& value_type) {
+  auto offsets = ArrayFromJSON(offset_type, "[0, 1, 1, 5, 2, 0, 0, 3, 3, 5, 0]");
+  auto sizes = ArrayFromJSON(offset_type, "[1, 2, 2, 0, 0, null, null, 2, 2, 1, 1]");
+  auto child_values = ArrayFromJSON(int32(), "[9, 1, 2, 3, null, 4]");
+  ASSERT_OK_AND_ASSIGN(auto list_view,
+                       ListViewArrayType::FromArrays(*offsets, *sizes, *child_values));
+  auto input = list_view->Slice(1, 9);
+  auto expected_values = ArrayFromJSON(value_type, "[[1, 2], [], null, [3, null], [4]]");
+  AssertNestedRunEndEncodeDecode(input, "[2, 4, 6, 8, 9]", expected_values);
+
+  AssertNestedRunEndEncodeDecode(ArrayFromJSON(value_type, "[]"), "[]",
+                                 ArrayFromJSON(value_type, "[]"));
+}
+
+TEST(TestRunEndEncodeDecodeNested, ListView) {
+  AssertListViewRunEndEncodeDecode<ListViewArray>(int32(), list_view(int32()));
+  AssertListViewRunEndEncodeDecode<LargeListViewArray>(int64(), large_list_view(int32()));
+}
+
+TEST(TestRunEndEncodeDecodeNested, FixedSizeList) {
+  auto value_type = fixed_size_list(int32(), 2);
+  auto input = ArrayFromJSON(value_type, R"([
+      [9, 9], [1, 2], [1, 2], [null, 2], [null, 2], null, null,
+      [3, 4], [3, 4], [5, 6], [9, 9]
+  ])");
+  input = input->Slice(1, 9);
+  auto expected_values =
+      ArrayFromJSON(value_type, "[[1, 2], [null, 2], null, [3, 4], [5, 6]]");
+  AssertNestedRunEndEncodeDecode(input, "[2, 4, 6, 8, 9]", expected_values);
+
+  AssertNestedRunEndEncodeDecode(ArrayFromJSON(value_type, "[]"), "[]",
+                                 ArrayFromJSON(value_type, "[]"));
+}
+
+TEST(TestRunEndEncodeDecodeNested, PreservesDictionaryIndexType) {
+  auto dictionary_type = dictionary(uint8(), utf8());
+  auto dictionary_values = ArrayFromJSON(utf8(), R"(["a", "b"])");
+  ASSERT_OK_AND_ASSIGN(
+      auto input_values,
+      DictionaryArray::FromArrays(dictionary_type, ArrayFromJSON(uint8(), "[0, 0, 1, 0]"),
+                                  dictionary_values));
+  ASSERT_OK_AND_ASSIGN(
+      auto input,
+      ListArray::FromArrays(*ArrayFromJSON(int32(), "[0, 1, 2, 3, 4]"), *input_values));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto expected_dictionary_values,
+      DictionaryArray::FromArrays(dictionary_type, ArrayFromJSON(uint8(), "[0, 1, 0]"),
+                                  dictionary_values));
+  ASSERT_OK_AND_ASSIGN(auto expected_values,
+                       ListArray::FromArrays(*ArrayFromJSON(int32(), "[0, 1, 2, 3]"),
+                                             *expected_dictionary_values));
+  AssertNestedRunEndEncodeDecode(input, "[2, 3, 4]", expected_values);
+}
+
+TEST(TestRunEndEncodeDecodeNested, DecodeWithOffsetInValuesArray) {
+  auto value_type = list(int32());
+  auto values = ArrayFromJSON(value_type, "[[9], [1], [2]]")->Slice(1);
+  auto expected = ArrayFromJSON(value_type, "[[1], [1], [2], [2], [2]]");
+
+  for (const auto& run_end_type : {int16(), int32(), int64()}) {
+    ARROW_SCOPED_TRACE("run end type = ", *run_end_type);
+    auto run_ends = ArrayFromJSON(run_end_type, "[1, 2, 5]")->Slice(1);
+    ASSERT_OK_AND_ASSIGN(auto encoded, RunEndEncodedArray::Make(5, run_ends, values));
+    ASSERT_OK(encoded->ValidateFull());
+
+    ASSERT_OK_AND_ASSIGN(Datum decoded_datum, RunEndDecode(encoded));
+    auto decoded = decoded_datum.make_array();
+    ASSERT_OK(decoded->ValidateFull());
+    ASSERT_ARRAYS_EQUAL(*decoded, *expected);
+
+    ASSERT_OK_AND_ASSIGN(Datum decoded_slice_datum, RunEndDecode(encoded->Slice(1, 3)));
+    auto decoded_slice = decoded_slice_datum.make_array();
+    ASSERT_OK(decoded_slice->ValidateFull());
+    ASSERT_ARRAYS_EQUAL(*decoded_slice, *expected->Slice(1, 3));
+  }
+}
+
+TEST(TestRunEndEncodeDecodeNested, Map) {
+  auto value_type = map(utf8(), int32(), /*keys_sorted=*/true);
+  auto input = ArrayFromJSON(value_type, R"([
+      [["skip", 9]],
+      [["a", 1], ["b", 2]],
+      [["a", 1], ["b", 2]],
+      [],
+      [],
+      null,
+      null,
+      [["a", null]],
+      [["a", null]],
+      [["c", 3]],
+      [["skip", 9]]
+  ])");
+  input = input->Slice(1, 9);
+  auto expected_values = ArrayFromJSON(value_type, R"([
+      [["a", 1], ["b", 2]],
+      [],
+      null,
+      [["a", null]],
+      [["c", 3]]
+  ])");
+  AssertNestedRunEndEncodeDecode(input, "[2, 4, 6, 8, 9]", expected_values);
+
+  AssertNestedRunEndEncodeDecode(ArrayFromJSON(value_type, "[]"), "[]",
+                                 ArrayFromJSON(value_type, "[]"));
+}
+
+TEST(TestRunEndEncodeDecodeNested, Struct) {
+  auto value_type = struct_({field("age", int32()), field("name", utf8())});
+  auto input = ArrayFromJSON(value_type, R"([
+      {"age": 99, "name": "skip"},
+      {"age": 20, "name": "a"},
+      {"age": 20, "name": "a"},
+      {"age": 20, "name": "b"},
+      null,
+      null,
+      {"age": null, "name": null},
+      {"age": null, "name": null},
+      {"age": 99, "name": "skip"}
+  ])");
+  input = input->Slice(1, 7);
+  auto expected_values = ArrayFromJSON(value_type, R"([
+      {"age": 20, "name": "a"},
+      {"age": 20, "name": "b"},
+      null,
+      {"age": null, "name": null}
+  ])");
+  AssertNestedRunEndEncodeDecode(input, "[2, 3, 5, 7]", expected_values);
+
+  AssertNestedRunEndEncodeDecode(ArrayFromJSON(value_type, "[]"), "[]",
+                                 ArrayFromJSON(value_type, "[]"));
+}
 
 }  // namespace compute
 }  // namespace arrow

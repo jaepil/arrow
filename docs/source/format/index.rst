@@ -32,9 +32,11 @@ Specifications
    CDataInterface
    CStreamInterface
    CDeviceDataInterface
+   StatisticsSchema
    DissociatedIPC
    Flight
    FlightSql
    ADBC
+   Security
    Integration
    Glossary

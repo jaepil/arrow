@@ -22,6 +22,7 @@
 #include <memory>
 #include <ostream>
 #include <random>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -30,14 +31,18 @@
 
 #include "arrow/io/memory.h"
 #include "arrow/util/key_value_metadata.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/pcg_random.h"
 #include "parquet/encryption/encryption_internal.h"
 #include "parquet/encryption/internal_file_decryptor.h"
 #include "parquet/exception.h"
 #include "parquet/schema.h"
 #include "parquet/schema_internal.h"
+#include "parquet/size_statistics.h"
+#include "parquet/statistics.h"
 #include "parquet/thrift_internal.h"
+
+using ::arrow::util::SecureString;
 
 namespace parquet {
 
@@ -75,9 +80,6 @@ std::string ParquetVersionToString(ParquetVersion::type ver) {
     case ParquetVersion::PARQUET_1_0:
       return "1.0";
       ARROW_SUPPRESS_DEPRECATION_WARNING
-    case ParquetVersion::PARQUET_2_0:
-      return "pseudo-2.0";
-      ARROW_UNSUPPRESS_DEPRECATION_WARNING
     case ParquetVersion::PARQUET_2_4:
       return "2.4";
     case ParquetVersion::PARQUET_2_6:
@@ -88,47 +90,85 @@ std::string ParquetVersionToString(ParquetVersion::type ver) {
   return "UNKNOWN";
 }
 
+namespace {
+
 template <typename DType>
-static std::shared_ptr<Statistics> MakeTypedColumnStats(
-    const format::ColumnMetaData& metadata, const ColumnDescriptor* descr) {
-  // If ColumnOrder is defined, return max_value and min_value
-  if (descr->column_order().get_order() == ColumnOrder::TYPE_DEFINED_ORDER) {
-    return MakeStatistics<DType>(
-        descr, metadata.statistics.min_value, metadata.statistics.max_value,
-        metadata.num_values - metadata.statistics.null_count,
-        metadata.statistics.null_count, metadata.statistics.distinct_count,
-        metadata.statistics.__isset.max_value && metadata.statistics.__isset.min_value,
-        metadata.statistics.__isset.null_count,
-        metadata.statistics.__isset.distinct_count);
+std::shared_ptr<Statistics> MakeTypedColumnStats(const format::ColumnMetaData& metadata,
+                                                 const ColumnDescriptor* descr,
+                                                 ::arrow::MemoryPool* pool) {
+  const auto& statistics = metadata.statistics;
+  const std::string kEmpty = "";
+  const std::string* encoded_min = &kEmpty;
+  const std::string* encoded_max = &kEmpty;
+  bool has_min_max = false;
+  std::optional<bool> min_exact = std::nullopt;
+  std::optional<bool> max_exact = std::nullopt;
+
+  switch (GetStatisticsMinMaxField(*descr)) {
+    case StatisticsMinMaxField::kMinValueMaxValue:
+      encoded_min = &statistics.min_value;
+      encoded_max = &statistics.max_value;
+      has_min_max = statistics.__isset.max_value && statistics.__isset.min_value;
+      min_exact = statistics.__isset.is_min_value_exact
+                      ? std::optional<bool>(statistics.is_min_value_exact)
+                      : std::nullopt;
+      max_exact = statistics.__isset.is_max_value_exact
+                      ? std::optional<bool>(statistics.is_max_value_exact)
+                      : std::nullopt;
+      break;
+    case StatisticsMinMaxField::kLegacyMinMax:
+      encoded_min = &statistics.min;
+      encoded_max = &statistics.max;
+      has_min_max = statistics.__isset.max && statistics.__isset.min;
+      break;
+    case StatisticsMinMaxField::kInvalid:
+      break;
   }
-  // Default behavior
+
   return MakeStatistics<DType>(
-      descr, metadata.statistics.min, metadata.statistics.max,
-      metadata.num_values - metadata.statistics.null_count,
-      metadata.statistics.null_count, metadata.statistics.distinct_count,
-      metadata.statistics.__isset.max && metadata.statistics.__isset.min,
-      metadata.statistics.__isset.null_count, metadata.statistics.__isset.distinct_count);
+      descr, *encoded_min, *encoded_max, metadata.num_values - statistics.null_count,
+      statistics.null_count, statistics.distinct_count, has_min_max,
+      statistics.__isset.null_count, statistics.__isset.distinct_count, min_exact,
+      max_exact, pool);
+}
+
+std::shared_ptr<geospatial::GeoStatistics> MakeColumnGeometryStats(
+    const format::ColumnMetaData& metadata, const ColumnDescriptor* descr) {
+  if (metadata.__isset.geospatial_statistics) {
+    geospatial::EncodedGeoStatistics encoded_geo_stats =
+        FromThrift(metadata.geospatial_statistics);
+    return std::make_shared<geospatial::GeoStatistics>(std::move(encoded_geo_stats));
+  } else {
+    return nullptr;
+  }
 }
 
 std::shared_ptr<Statistics> MakeColumnStats(const format::ColumnMetaData& meta_data,
-                                            const ColumnDescriptor* descr) {
-  switch (static_cast<Type::type>(meta_data.type)) {
+                                            const ColumnDescriptor* descr,
+                                            ::arrow::MemoryPool* pool) {
+  auto metadata_type = LoadEnumSafe(&meta_data.type);
+  if (descr->physical_type() != metadata_type) {
+    throw ParquetException(
+        "ColumnMetaData type does not match ColumnDescriptor physical type: " +
+        TypeToString(metadata_type) + " vs. " + TypeToString(descr->physical_type()));
+  }
+  switch (metadata_type) {
     case Type::BOOLEAN:
-      return MakeTypedColumnStats<BooleanType>(meta_data, descr);
+      return MakeTypedColumnStats<BooleanType>(meta_data, descr, pool);
     case Type::INT32:
-      return MakeTypedColumnStats<Int32Type>(meta_data, descr);
+      return MakeTypedColumnStats<Int32Type>(meta_data, descr, pool);
     case Type::INT64:
-      return MakeTypedColumnStats<Int64Type>(meta_data, descr);
+      return MakeTypedColumnStats<Int64Type>(meta_data, descr, pool);
     case Type::INT96:
-      return MakeTypedColumnStats<Int96Type>(meta_data, descr);
+      return MakeTypedColumnStats<Int96Type>(meta_data, descr, pool);
     case Type::DOUBLE:
-      return MakeTypedColumnStats<DoubleType>(meta_data, descr);
+      return MakeTypedColumnStats<DoubleType>(meta_data, descr, pool);
     case Type::FLOAT:
-      return MakeTypedColumnStats<FloatType>(meta_data, descr);
+      return MakeTypedColumnStats<FloatType>(meta_data, descr, pool);
     case Type::BYTE_ARRAY:
-      return MakeTypedColumnStats<ByteArrayType>(meta_data, descr);
+      return MakeTypedColumnStats<ByteArrayType>(meta_data, descr, pool);
     case Type::FIXED_LEN_BYTE_ARRAY:
-      return MakeTypedColumnStats<FLBAType>(meta_data, descr);
+      return MakeTypedColumnStats<FLBAType>(meta_data, descr, pool);
     case Type::UNDEFINED:
       break;
   }
@@ -167,6 +207,8 @@ void ToThriftKeyValueMetadata(const KeyValueMetadata& source, Metadata* metadata
   }
   metadata->__set_key_value_metadata(std::move(key_value_metadata));
 }
+
+}  // namespace
 
 // MetaData Accessor
 
@@ -218,37 +260,36 @@ const std::string& ColumnCryptoMetaData::key_metadata() const {
 // ColumnChunk metadata
 class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
  public:
-  explicit ColumnChunkMetaDataImpl(const format::ColumnChunk* column,
-                                   const ColumnDescriptor* descr,
-                                   int16_t row_group_ordinal, int16_t column_ordinal,
-                                   const ReaderProperties& properties,
-                                   const ApplicationVersion* writer_version,
-                                   std::shared_ptr<InternalFileDecryptor> file_decryptor)
+  explicit ColumnChunkMetaDataImpl(
+      const format::ColumnChunk* column, const ColumnDescriptor* descr,
+      int16_t row_group_ordinal, int16_t column_ordinal,
+      const ReaderProperties& properties, const ApplicationVersion* writer_version,
+      const std::shared_ptr<InternalFileDecryptor>& file_decryptor)
       : column_(column),
         descr_(descr),
         properties_(properties),
         writer_version_(writer_version) {
     column_metadata_ = &column->meta_data;
     if (column->__isset.crypto_metadata) {  // column metadata is encrypted
-      format::ColumnCryptoMetaData ccmd = column->crypto_metadata;
+      const format::ColumnCryptoMetaData& ccmd = column->crypto_metadata;
 
       if (ccmd.__isset.ENCRYPTION_WITH_COLUMN_KEY) {
         if (file_decryptor != nullptr && file_decryptor->properties() != nullptr) {
           // should decrypt metadata
           std::shared_ptr<schema::ColumnPath> path = std::make_shared<schema::ColumnPath>(
               ccmd.ENCRYPTION_WITH_COLUMN_KEY.path_in_schema);
-          std::string key_metadata = ccmd.ENCRYPTION_WITH_COLUMN_KEY.key_metadata;
+          const std::string& key_metadata = ccmd.ENCRYPTION_WITH_COLUMN_KEY.key_metadata;
 
           std::string aad_column_metadata = encryption::CreateModuleAad(
               file_decryptor->file_aad(), encryption::kColumnMetaData, row_group_ordinal,
-              column_ordinal, static_cast<int16_t>(-1));
+              column_ordinal, /*page_ordinal=*/static_cast<int16_t>(-1));
           auto decryptor = file_decryptor->GetColumnMetaDecryptor(
               path->ToDotString(), key_metadata, aad_column_metadata);
-          auto len = static_cast<uint32_t>(column->encrypted_column_metadata.size());
           ThriftDeserializer deserializer(properties_);
           deserializer.DeserializeMessage(
               reinterpret_cast<const uint8_t*>(column->encrypted_column_metadata.c_str()),
-              &len, &decrypted_metadata_, decryptor.get());
+              column->encrypted_column_metadata.size(), &decrypted_metadata_,
+              decryptor.get());
           column_metadata_ = &decrypted_metadata_;
         } else {
           throw ParquetException(
@@ -265,7 +306,14 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
                                  LoadEnumSafe(&encoding_stats.encoding),
                                  encoding_stats.count});
     }
+    if (column_metadata_->__isset.size_statistics) {
+      size_statistics_ =
+          std::make_shared<SizeStatistics>(FromThrift(column_metadata_->size_statistics));
+      size_statistics_->Validate(descr_);
+    }
     possible_stats_ = nullptr;
+    possible_encoded_stats_ = nullptr;
+    possible_geo_stats_ = nullptr;
     InitKeyValueMetadata();
   }
 
@@ -290,22 +338,52 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
   // 2) Statistics must not be corrupted
   inline bool is_stats_set() const {
     DCHECK(writer_version_ != nullptr);
-    // If the column statistics don't exist or column sort order is unknown
-    // we cannot use the column stats
-    if (!column_metadata_->__isset.statistics ||
-        descr_->sort_order() == SortOrder::UNKNOWN) {
+    if (!column_metadata_->__isset.statistics) {
       return false;
     }
-    if (possible_stats_ == nullptr) {
-      possible_stats_ = MakeColumnStats(*column_metadata_, descr_);
+    {
+      const std::lock_guard<std::mutex> guard(stats_mutex_);
+      if (possible_encoded_stats_ == nullptr) {
+        possible_encoded_stats_ = std::make_shared<EncodedStatistics>(
+            FromThrift(column_metadata_->statistics, GetStatisticsMinMaxField(*descr_)));
+      }
     }
-    EncodedStatistics encodedStatistics = possible_stats_->Encode();
-    return writer_version_->HasCorrectStatistics(type(), encodedStatistics,
+    return writer_version_->HasCorrectStatistics(type(), *possible_encoded_stats_,
                                                  descr_->sort_order());
   }
 
+  inline bool is_geo_stats_set() const {
+    const std::lock_guard<std::mutex> guard(stats_mutex_);
+    if (possible_geo_stats_ == nullptr &&
+        column_metadata_->__isset.geospatial_statistics) {
+      possible_geo_stats_ = MakeColumnGeometryStats(*column_metadata_, descr_);
+    }
+
+    return possible_geo_stats_ != nullptr && possible_geo_stats_->is_valid();
+  }
+
+  inline std::shared_ptr<EncodedStatistics> encoded_statistics() const {
+    return is_stats_set() ? possible_encoded_stats_ : nullptr;
+  }
+
   inline std::shared_ptr<Statistics> statistics() const {
-    return is_stats_set() ? possible_stats_ : nullptr;
+    if (is_stats_set()) {
+      const std::lock_guard<std::mutex> guard(stats_mutex_);
+      if (possible_stats_ == nullptr) {
+        possible_stats_ =
+            MakeColumnStats(*column_metadata_, descr_, properties_.memory_pool());
+      }
+      return possible_stats_;
+    }
+    return nullptr;
+  }
+
+  inline std::shared_ptr<SizeStatistics> size_statistics() const {
+    return size_statistics_;
+  }
+
+  inline std::shared_ptr<geospatial::GeoStatistics> geospatial_statistics() const {
+    return is_geo_stats_set() ? possible_geo_stats_ : nullptr;
   }
 
   inline Compression::type compression() const {
@@ -386,7 +464,10 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
     key_value_metadata_ = FromThriftKeyValueMetadata(*column_metadata_);
   }
 
+  mutable std::mutex stats_mutex_;
+  mutable std::shared_ptr<EncodedStatistics> possible_encoded_stats_;
   mutable std::shared_ptr<Statistics> possible_stats_;
+  mutable std::shared_ptr<geospatial::GeoStatistics> possible_geo_stats_;
   std::vector<Encoding::type> encodings_;
   std::vector<PageEncodingStats> encoding_stats_;
   const format::ColumnChunk* column_;
@@ -396,6 +477,7 @@ class ColumnChunkMetaData::ColumnChunkMetaDataImpl {
   const ReaderProperties properties_;
   const ApplicationVersion* writer_version_;
   std::shared_ptr<const KeyValueMetadata> key_value_metadata_;
+  std::shared_ptr<SizeStatistics> size_statistics_;
 };
 
 std::unique_ptr<ColumnChunkMetaData> ColumnChunkMetaData::Make(
@@ -433,11 +515,25 @@ std::shared_ptr<schema::ColumnPath> ColumnChunkMetaData::path_in_schema() const 
   return impl_->path_in_schema();
 }
 
+std::shared_ptr<EncodedStatistics> ColumnChunkMetaData::encoded_statistics() const {
+  return impl_->encoded_statistics();
+}
+
 std::shared_ptr<Statistics> ColumnChunkMetaData::statistics() const {
   return impl_->statistics();
 }
 
+std::shared_ptr<geospatial::GeoStatistics> ColumnChunkMetaData::geo_statistics() const {
+  return impl_->geospatial_statistics();
+}
+
 bool ColumnChunkMetaData::is_stats_set() const { return impl_->is_stats_set(); }
+
+std::shared_ptr<SizeStatistics> ColumnChunkMetaData::size_statistics() const {
+  return impl_->size_statistics();
+}
+
+bool ColumnChunkMetaData::is_geo_stats_set() const { return impl_->is_geo_stats_set(); }
 
 std::optional<int64_t> ColumnChunkMetaData::bloom_filter_offset() const {
   return impl_->bloom_filter_offset();
@@ -550,9 +646,11 @@ class RowGroupMetaData::RowGroupMetaDataImpl {
 
   std::unique_ptr<ColumnChunkMetaData> ColumnChunk(int i) {
     if (i >= 0 && i < num_columns()) {
+      int16_t row_group_ordinal =
+          row_group_->__isset.ordinal ? row_group_->ordinal : static_cast<int16_t>(-1);
       return ColumnChunkMetaData::Make(&row_group_->columns[i], schema_->Column(i),
-                                       properties_, writer_version_, row_group_->ordinal,
-                                       i, file_decryptor_);
+                                       properties_, writer_version_, row_group_ordinal, i,
+                                       file_decryptor_);
     }
     throw ParquetException("The file only has ", num_columns(),
                            " columns, requested metadata for column: ", i);
@@ -680,9 +778,12 @@ class FileMetaData::FileMetaDataImpl {
  public:
   FileMetaDataImpl() = default;
 
-  explicit FileMetaDataImpl(
-      const void* metadata, uint32_t* metadata_len, ReaderProperties properties,
-      std::shared_ptr<InternalFileDecryptor> file_decryptor = nullptr)
+  explicit FileMetaDataImpl(ReaderProperties properties)
+      : properties_(std::move(properties)) {}
+
+  FileMetaDataImpl(const void* metadata, int64_t metadata_len,
+                   ReaderProperties properties,
+                   std::shared_ptr<InternalFileDecryptor> file_decryptor = nullptr)
       : properties_(std::move(properties)), file_decryptor_(std::move(file_decryptor)) {
     metadata_ = std::make_unique<format::FileMetaData>();
 
@@ -690,10 +791,9 @@ class FileMetaData::FileMetaDataImpl {
         file_decryptor_ != nullptr ? file_decryptor_->GetFooterDecryptor() : nullptr;
 
     ThriftDeserializer deserializer(properties_);
-    deserializer.DeserializeMessage(reinterpret_cast<const uint8_t*>(metadata),
-                                    metadata_len, metadata_.get(),
-                                    footer_decryptor.get());
-    metadata_len_ = *metadata_len;
+    metadata_len_ = deserializer.DeserializeMessage(
+        reinterpret_cast<const uint8_t*>(metadata), metadata_len, metadata_.get(),
+        footer_decryptor.get());
 
     if (metadata_->__isset.created_by) {
       writer_version_ = ApplicationVersion(metadata_->created_by);
@@ -712,38 +812,33 @@ class FileMetaData::FileMetaDataImpl {
       throw ParquetException("Decryption not set properly. cannot verify signature");
     }
     // serialize the footer
-    uint8_t* serialized_data;
-    uint32_t serialized_len = metadata_len_;
     ThriftSerializer serializer;
-    serializer.SerializeToBuffer(metadata_.get(), &serialized_len, &serialized_data);
-    ::arrow::util::span<const uint8_t> serialized_data_span(serialized_data,
-                                                            serialized_len);
+    auto serialized_data_span = serializer.SerializeToBuffer(metadata_.get());
 
     // encrypt with nonce
-    ::arrow::util::span<const uint8_t> nonce(reinterpret_cast<const uint8_t*>(signature),
-                                             encryption::kNonceLength);
+    std::span<const uint8_t> nonce(reinterpret_cast<const uint8_t*>(signature),
+                                   encryption::kNonceLength);
     auto tag = reinterpret_cast<const uint8_t*>(signature) + encryption::kNonceLength;
 
-    std::string key = file_decryptor_->GetFooterKey();
-    std::string aad = encryption::CreateFooterAad(file_decryptor_->file_aad());
+    const SecureString& key = file_decryptor_->GetFooterKey();
+    const std::string& aad = encryption::CreateFooterAad(file_decryptor_->file_aad());
 
     auto aes_encryptor = encryption::AesEncryptor::Make(file_decryptor_->algorithm(),
                                                         static_cast<int>(key.size()),
                                                         true, false /*write_length*/);
 
     std::shared_ptr<Buffer> encrypted_buffer = AllocateBuffer(
-        file_decryptor_->pool(), aes_encryptor->CiphertextLength(serialized_len));
+        file_decryptor_->pool(), aes_encryptor->CiphertextLength(
+                                     static_cast<int64_t>(serialized_data_span.size())));
     int32_t encrypted_len = aes_encryptor->SignedFooterEncrypt(
-        serialized_data_span, str2span(key), str2span(aad), nonce,
+        serialized_data_span, key.as_span(), str2span(aad), nonce,
         encrypted_buffer->mutable_span_as<uint8_t>());
-    // Delete AES encryptor object. It was created only to verify the footer signature.
-    aes_encryptor->WipeOut();
     return 0 ==
            memcmp(encrypted_buffer->data() + encrypted_len - encryption::kGcmTagLength,
                   tag, encryption::kGcmTagLength);
   }
 
-  inline uint32_t size() const { return metadata_len_; }
+  inline int64_t size() const { return metadata_len_; }
   inline int num_columns() const { return schema_.num_columns(); }
   inline int64_t num_rows() const { return metadata_->num_rows; }
   inline int num_row_groups() const {
@@ -773,18 +868,16 @@ class FileMetaData::FileMetaDataImpl {
     // Only in encrypted files with plaintext footers the
     // encryption_algorithm is set in footer
     if (is_encryption_algorithm_set()) {
-      uint8_t* serialized_data;
-      uint32_t serialized_len;
-      serializer.SerializeToBuffer(metadata_.get(), &serialized_len, &serialized_data);
-      ::arrow::util::span<const uint8_t> serialized_data_span(serialized_data,
-                                                              serialized_len);
+      const auto serialized_data_span = serializer.SerializeToBuffer(metadata_.get());
+      const auto serialized_data_len = static_cast<int64_t>(serialized_data_span.size());
 
       // encrypt the footer key
-      std::vector<uint8_t> encrypted_data(encryptor->CiphertextLength(serialized_len));
+      std::vector<uint8_t> encrypted_data(
+          encryptor->CiphertextLength(serialized_data_len));
       int32_t encrypted_len = encryptor->Encrypt(serialized_data_span, encrypted_data);
 
       // write unencrypted footer
-      PARQUET_THROW_NOT_OK(dst->Write(serialized_data, serialized_len));
+      PARQUET_THROW_NOT_OK(dst->Write(serialized_data_span.data(), serialized_data_len));
       // Write signature (nonce and tag)
       PARQUET_THROW_NOT_OK(
           dst->Write(encrypted_data.data() + 4, encryption::kNonceLength));
@@ -906,9 +999,7 @@ class FileMetaData::FileMetaDataImpl {
       return ss.str();
     } else {
       ThriftSerializer serializer;
-      std::string out;
-      serializer.SerializeToString(&md, &out);
-      return out;
+      return std::string(serializer.SerializeToString(&md));
     }
   }
 
@@ -922,7 +1013,7 @@ class FileMetaData::FileMetaDataImpl {
 
  private:
   friend FileMetaDataBuilder;
-  uint32_t metadata_len_ = 0;
+  int64_t metadata_len_ = 0;
   std::unique_ptr<format::FileMetaData> metadata_;
   SchemaDescriptor schema_;
   ApplicationVersion writer_version_;
@@ -934,8 +1025,8 @@ class FileMetaData::FileMetaDataImpl {
     if (metadata_->schema.empty()) {
       throw ParquetException("Empty file schema (no root)");
     }
-    schema_.Init(schema::Unflatten(&metadata_->schema[0],
-                                   static_cast<int>(metadata_->schema.size())));
+    schema_.Init(schema::Unflatten(metadata_->schema,
+                                   /*max_depth=*/properties_.schema_depth_limit()));
   }
 
   void InitColumnOrders() {
@@ -947,7 +1038,7 @@ class FileMetaData::FileMetaDataImpl {
         if (column_order.__isset.TYPE_ORDER) {
           column_orders.push_back(ColumnOrder::type_defined_);
         } else {
-          column_orders.push_back(ColumnOrder::undefined_);
+          column_orders.push_back(ColumnOrder::unknown_);
         }
       }
     } else {
@@ -963,18 +1054,31 @@ class FileMetaData::FileMetaDataImpl {
 };
 
 std::shared_ptr<FileMetaData> FileMetaData::Make(
-    const void* metadata, uint32_t* metadata_len, const ReaderProperties& properties,
+    const void* metadata, int64_t metadata_len, const ReaderProperties& properties,
     std::shared_ptr<InternalFileDecryptor> file_decryptor) {
   // This FileMetaData ctor is private, not compatible with std::make_shared
   return std::shared_ptr<FileMetaData>(
       new FileMetaData(metadata, metadata_len, properties, std::move(file_decryptor)));
 }
 
-FileMetaData::FileMetaData(const void* metadata, uint32_t* metadata_len,
+// (deprecated)
+std::shared_ptr<FileMetaData> FileMetaData::Make(
+    const void* metadata, uint32_t* metadata_len, const ReaderProperties& properties,
+    std::shared_ptr<InternalFileDecryptor> file_decryptor) {
+  auto ptr =
+      FileMetaData::Make(metadata, *metadata_len, properties, std::move(file_decryptor));
+  *metadata_len = static_cast<uint32_t>(ptr->size());
+  return ptr;
+}
+
+FileMetaData::FileMetaData(const void* metadata, int64_t metadata_len,
                            const ReaderProperties& properties,
                            std::shared_ptr<InternalFileDecryptor> file_decryptor)
     : impl_(new FileMetaDataImpl(metadata, metadata_len, properties,
                                  std::move(file_decryptor))) {}
+
+FileMetaData::FileMetaData(ReaderProperties properties)
+    : impl_(new FileMetaDataImpl(std::move(properties))) {}
 
 FileMetaData::FileMetaData() : impl_(new FileMetaDataImpl()) {}
 
@@ -992,7 +1096,7 @@ bool FileMetaData::VerifySignature(const void* signature) {
   return impl_->VerifySignature(signature);
 }
 
-uint32_t FileMetaData::size() const { return impl_->size(); }
+int64_t FileMetaData::size() const { return impl_->size(); }
 
 int FileMetaData::num_columns() const { return impl_->num_columns(); }
 
@@ -1078,15 +1182,50 @@ void FileMetaData::WriteTo(::arrow::io::OutputStream* dst,
   return impl_->WriteTo(dst, encryptor);
 }
 
+bool FileMetaData::VerifySignature(std::span<const uint8_t> serialized_metadata,
+                                   std::span<const uint8_t> signature,
+                                   InternalFileDecryptor* file_decryptor) {
+  DCHECK_NE(file_decryptor, nullptr);
+
+  // In plaintext footer, the "signature" is the concatenation of the nonce used
+  // for GCM encryption, and the authentication tag obtained after GCM encryption.
+  if (signature.size() != encryption::kGcmTagLength + encryption::kNonceLength) {
+    throw ParquetInvalidOrCorruptedFileException(
+        "Invalid footer encryption signature (expected ",
+        encryption::kGcmTagLength + encryption::kNonceLength, " bytes, got ",
+        signature.size(), ")");
+  }
+
+  // Encrypt plaintext serialized metadata so as to compute its signature
+  auto nonce = signature.subspan(0, encryption::kNonceLength);
+  auto tag = signature.subspan(encryption::kNonceLength);
+  const SecureString& key = file_decryptor->GetFooterKey();
+  const std::string& aad = encryption::CreateFooterAad(file_decryptor->file_aad());
+
+  auto aes_encryptor = encryption::AesEncryptor::Make(
+      file_decryptor->algorithm(), static_cast<int>(key.size()), /*metadata=*/true,
+      /*write_length=*/false);
+
+  std::shared_ptr<Buffer> encrypted_buffer =
+      AllocateBuffer(file_decryptor->pool(),
+                     aes_encryptor->CiphertextLength(serialized_metadata.size()));
+  int32_t encrypted_len = aes_encryptor->SignedFooterEncrypt(
+      serialized_metadata, key.as_span(), str2span(aad), nonce,
+      encrypted_buffer->mutable_span_as<uint8_t>());
+  DCHECK_EQ(encrypted_len, encrypted_buffer->size());
+  // Check computed signature against expected
+  return 0 == memcmp(encrypted_buffer->data() + encrypted_len - encryption::kGcmTagLength,
+                     tag.data(), encryption::kGcmTagLength);
+}
+
 class FileCryptoMetaData::FileCryptoMetaDataImpl {
  public:
   FileCryptoMetaDataImpl() = default;
 
-  explicit FileCryptoMetaDataImpl(const uint8_t* metadata, uint32_t* metadata_len,
+  explicit FileCryptoMetaDataImpl(const uint8_t* metadata, int64_t metadata_len,
                                   const ReaderProperties& properties) {
     ThriftDeserializer deserializer(properties);
-    deserializer.DeserializeMessage(metadata, metadata_len, &metadata_);
-    metadata_len_ = *metadata_len;
+    metadata_len_ = deserializer.DeserializeMessage(metadata, metadata_len, &metadata_);
   }
 
   EncryptionAlgorithm encryption_algorithm() const {
@@ -1100,10 +1239,12 @@ class FileCryptoMetaData::FileCryptoMetaDataImpl {
     serializer.Serialize(&metadata_, dst);
   }
 
+  int64_t size() const { return metadata_len_; }
+
  private:
   friend FileMetaDataBuilder;
   format::FileCryptoMetaData metadata_;
-  uint32_t metadata_len_;
+  int64_t metadata_len_;
 };
 
 EncryptionAlgorithm FileCryptoMetaData::encryption_algorithm() const {
@@ -1114,15 +1255,26 @@ const std::string& FileCryptoMetaData::key_metadata() const {
   return impl_->key_metadata();
 }
 
+int64_t FileCryptoMetaData::size() const { return impl_->size(); }
+
 std::shared_ptr<FileCryptoMetaData> FileCryptoMetaData::Make(
-    const uint8_t* serialized_metadata, uint32_t* metadata_len,
+    const uint8_t* serialized_metadata, int64_t metadata_len,
     const ReaderProperties& properties) {
   return std::shared_ptr<FileCryptoMetaData>(
       new FileCryptoMetaData(serialized_metadata, metadata_len, properties));
 }
 
+// (deprecated)
+std::shared_ptr<FileCryptoMetaData> FileCryptoMetaData::Make(
+    const uint8_t* serialized_metadata, uint32_t* metadata_len,
+    const ReaderProperties& properties) {
+  auto ptr = FileCryptoMetaData::Make(serialized_metadata, *metadata_len, properties);
+  *metadata_len = static_cast<uint32_t>(ptr->size());
+  return ptr;
+}
+
 FileCryptoMetaData::FileCryptoMetaData(const uint8_t* serialized_metadata,
-                                       uint32_t* metadata_len,
+                                       int64_t metadata_len,
                                        const ReaderProperties& properties)
     : impl_(new FileCryptoMetaDataImpl(serialized_metadata, metadata_len, properties)) {}
 
@@ -1475,7 +1627,7 @@ bool ApplicationVersion::VersionEq(const ApplicationVersion& other_version) cons
 // parquet-mr/parquet-column/src/main/java/org/apache/parquet/CorruptStatistics.java
 // PARQUET-686 has more discussion on statistics
 bool ApplicationVersion::HasCorrectStatistics(Type::type col_type,
-                                              EncodedStatistics& statistics,
+                                              const EncodedStatistics& statistics,
                                               SortOrder::type sort_order) const {
   // parquet-cpp version 1.3.0 and parquet-mr 1.10.0 onwards stats are computed
   // correctly for all types
@@ -1499,11 +1651,6 @@ bool ApplicationVersion::HasCorrectStatistics(Type::type col_type,
   // parquet-mr during the same time as PARQUET-251, see PARQUET-297
   if (application_ == "unknown") {
     return true;
-  }
-
-  // Unknown sort order has incorrect stats
-  if (SortOrder::UNKNOWN == sort_order) {
-    return false;
   }
 
   // PARQUET-251
@@ -1541,6 +1688,14 @@ class ColumnChunkMetaDataBuilder::ColumnChunkMetaDataBuilderImpl {
   // column metadata
   void SetStatistics(const EncodedStatistics& val) {
     column_chunk_->meta_data.__set_statistics(ToThrift(val));
+  }
+
+  void SetSizeStatistics(const SizeStatistics& size_stats) {
+    column_chunk_->meta_data.__set_size_statistics(ToThrift(size_stats));
+  }
+
+  void SetGeoStatistics(const geospatial::EncodedGeoStatistics& val) {
+    column_chunk_->meta_data.__set_geospatial_statistics(ToThrift(val));
   }
 
   void Finish(int64_t num_values, int64_t dictionary_page_offset,
@@ -1638,21 +1793,18 @@ class ColumnChunkMetaDataBuilder::ColumnChunkMetaDataBuilderImpl {
         // Serialize and encrypt ColumnMetadata separately
         // Thrift-serialize the ColumnMetaData structure,
         // encrypt it with the column key, and write to encrypted_column_metadata
-        uint8_t* serialized_data;
-        uint32_t serialized_len;
+        auto serialized_data_span =
+            serializer.SerializeToBuffer(&column_chunk_->meta_data);
 
-        serializer.SerializeToBuffer(&column_chunk_->meta_data, &serialized_len,
-                                     &serialized_data);
-        ::arrow::util::span<const uint8_t> serialized_data_span(serialized_data,
-                                                                serialized_len);
-
-        std::vector<uint8_t> encrypted_data(encryptor->CiphertextLength(serialized_len));
-        int32_t encrypted_len = encryptor->Encrypt(serialized_data_span, encrypted_data);
-
-        const char* temp =
-            const_cast<const char*>(reinterpret_cast<char*>(encrypted_data.data()));
-        std::string encrypted_column_metadata(temp, encrypted_len);
-        column_chunk_->__set_encrypted_column_metadata(encrypted_column_metadata);
+        std::string encrypted_metadata;
+        encrypted_metadata.resize(encryptor->CiphertextLength(
+            static_cast<int64_t>(serialized_data_span.size())));
+        int32_t encrypted_len = encryptor->Encrypt(
+            serialized_data_span,
+            std::span(reinterpret_cast<uint8_t*>(encrypted_metadata.data()),
+                      encrypted_metadata.size()));
+        encrypted_metadata.resize(encrypted_len);
+        column_chunk_->__set_encrypted_column_metadata(std::move(encrypted_metadata));
 
         if (encrypted_footer) {
           column_chunk_->__isset.meta_data = false;
@@ -1752,6 +1904,15 @@ void ColumnChunkMetaDataBuilder::SetStatistics(const EncodedStatistics& result) 
   impl_->SetStatistics(result);
 }
 
+void ColumnChunkMetaDataBuilder::SetSizeStatistics(const SizeStatistics& size_stats) {
+  impl_->SetSizeStatistics(size_stats);
+}
+
+void ColumnChunkMetaDataBuilder::SetGeoStatistics(
+    const geospatial::EncodedGeoStatistics& result) {
+  impl_->SetGeoStatistics(result);
+}
+
 void ColumnChunkMetaDataBuilder::SetKeyValueMetadata(
     std::shared_ptr<const KeyValueMetadata> key_value_metadata) {
   impl_->SetKeyValueMetadata(std::move(key_value_metadata));
@@ -1831,7 +1992,9 @@ class RowGroupMetaDataBuilder::RowGroupMetaDataBuilderImpl {
     row_group_->__set_file_offset(file_offset);
     row_group_->__set_total_compressed_size(total_compressed_size);
     row_group_->__set_total_byte_size(total_bytes_written);
-    row_group_->__set_ordinal(row_group_ordinal);
+    if (row_group_ordinal >= 0) {
+      row_group_->__set_ordinal(row_group_ordinal);
+    }
   }
 
   void set_num_rows(int64_t num_rows) { row_group_->num_rows = num_rows; }
@@ -1904,37 +2067,32 @@ class FileMetaDataBuilder::FileMetaDataBuilderImpl {
     return current_row_group_builder_.get();
   }
 
-  void SetPageIndexLocation(const PageIndexLocation& location) {
-    auto set_index_location =
-        [this](size_t row_group_ordinal,
-               const PageIndexLocation::FileIndexLocation& file_index_location,
-               bool column_index) {
-          auto& row_group_metadata = this->row_groups_.at(row_group_ordinal);
-          auto iter = file_index_location.find(row_group_ordinal);
-          if (iter != file_index_location.cend()) {
-            const auto& row_group_index_location = iter->second;
-            for (size_t i = 0; i < row_group_index_location.size(); ++i) {
-              if (i >= row_group_metadata.columns.size()) {
-                throw ParquetException("Cannot find metadata for column ordinal ", i);
-              }
-              auto& column_metadata = row_group_metadata.columns.at(i);
-              const auto& index_location = row_group_index_location.at(i);
-              if (index_location.has_value()) {
-                if (column_index) {
-                  column_metadata.__set_column_index_offset(index_location->offset);
-                  column_metadata.__set_column_index_length(index_location->length);
-                } else {
-                  column_metadata.__set_offset_index_offset(index_location->offset);
-                  column_metadata.__set_offset_index_length(index_location->length);
-                }
-              }
-            }
-          }
-        };
+  void SetIndexLocations(IndexKind kind, const IndexLocations& locations) {
+    for (const auto& [chunk_id, location] : locations) {
+      auto row_group_id = static_cast<size_t>(chunk_id.row_group_index);
+      if (row_group_id >= row_groups_.size()) {
+        throw ParquetException("Row group id out of range: ", row_group_id);
+      }
 
-    for (size_t i = 0; i < row_groups_.size(); ++i) {
-      set_index_location(i, location.column_index_location, true);
-      set_index_location(i, location.offset_index_location, false);
+      auto& row_group_metadata = row_groups_.at(row_group_id);
+      auto column_id = static_cast<size_t>(chunk_id.column_index);
+      if (column_id >= row_group_metadata.columns.size()) {
+        throw ParquetException("Column id out of range: ", column_id);
+      }
+
+      auto& column_metadata = row_group_metadata.columns.at(column_id);
+      if (kind == IndexKind::kColumnIndex) {
+        column_metadata.__set_column_index_offset(location.offset);
+        column_metadata.__set_column_index_length(location.length);
+      } else if (kind == IndexKind::kOffsetIndex) {
+        column_metadata.__set_offset_index_offset(location.offset);
+        column_metadata.__set_offset_index_length(location.length);
+      } else if (kind == IndexKind::kBloomFilter) {
+        column_metadata.meta_data.__set_bloom_filter_offset(location.offset);
+        column_metadata.meta_data.__set_bloom_filter_length(location.length);
+      } else {
+        throw ParquetException("Invalid index kind: ", static_cast<int>(kind));
+      }
     }
   }
 
@@ -1995,10 +2153,15 @@ class FileMetaDataBuilder::FileMetaDataBuilderImpl {
       }
     }
 
-    ToParquet(static_cast<parquet::schema::GroupNode*>(schema_->schema_root().get()),
-              &metadata_->schema);
-    auto file_meta_data = std::unique_ptr<FileMetaData>(new FileMetaData());
+    SchemaToThrift(static_cast<parquet::schema::GroupNode*>(schema_->schema_root().get()),
+                   &metadata_->schema);
+    ReaderProperties properties;
+    // Disable schema nesting depth for schema restruction in InitSchema below.
+    properties.set_schema_depth_limit(std::numeric_limits<int32_t>::max());
+    auto file_meta_data =
+        std::unique_ptr<FileMetaData>(new FileMetaData(std::move(properties)));
     file_meta_data->impl_->metadata_ = std::move(metadata_);
+    // XXX Why are we reconstructing the schema from the flattened Thrift structures?
     file_meta_data->impl_->InitSchema();
     file_meta_data->impl_->InitKeyValueMetadata();
     return file_meta_data;
@@ -2052,8 +2215,9 @@ RowGroupMetaDataBuilder* FileMetaDataBuilder::AppendRowGroup() {
   return impl_->AppendRowGroup();
 }
 
-void FileMetaDataBuilder::SetPageIndexLocation(const PageIndexLocation& location) {
-  impl_->SetPageIndexLocation(location);
+void FileMetaDataBuilder::SetIndexLocations(IndexKind kind,
+                                            const IndexLocations& locations) {
+  impl_->SetIndexLocations(kind, locations);
 }
 
 std::unique_ptr<FileMetaData> FileMetaDataBuilder::Finish(

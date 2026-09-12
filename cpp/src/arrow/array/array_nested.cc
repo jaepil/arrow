@@ -33,6 +33,7 @@
 #include "arrow/array/util.h"
 #include "arrow/buffer.h"
 #include "arrow/status.h"
+#include "arrow/tensor.h"
 #include "arrow/type.h"
 #include "arrow/type_fwd.h"
 #include "arrow/type_traits.h"
@@ -40,8 +41,9 @@
 #include "arrow/util/bitmap_generate.h"
 #include "arrow/util/bitmap_ops.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/int_util_overflow.h"
 #include "arrow/util/list_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/unreachable.h"
 
 namespace arrow {
@@ -115,7 +117,7 @@ Result<std::shared_ptr<typename TypeTraits<TYPE>::ArrayType>> ListArrayFromArray
     return Status::TypeError("List offsets must be ", OffsetArrowType::type_name());
   }
 
-  if (null_bitmap != nullptr && offsets.data()->MayHaveNulls()) {
+  if (null_bitmap != nullptr && offsets.data()->GetNullCount() != 0) {
     return Status::Invalid(
         "Ambiguous to specify both validity map and offsets with nulls");
   }
@@ -826,7 +828,7 @@ Result<std::shared_ptr<Array>> MapArray::FromArraysInternal(
     return Status::Invalid("Map key and item arrays must be equal length");
   }
 
-  if (null_bitmap != nullptr && offsets->data()->MayHaveNulls()) {
+  if (null_bitmap != nullptr && offsets->data()->GetNullCount() != 0) {
     return Status::Invalid(
         "Ambiguous to specify both validity map and offsets with nulls");
   }
@@ -835,7 +837,7 @@ Result<std::shared_ptr<Array>> MapArray::FromArraysInternal(
     return Status::NotImplemented("Null bitmap with offsets slice not supported.");
   }
 
-  if (offsets->data()->MayHaveNulls()) {
+  if (offsets->data()->GetNullCount() != 0) {
     ARROW_ASSIGN_OR_RAISE(auto buffers,
                           CleanListOffsets<MapType>(NULLPTR, *offsets, pool));
     return std::make_shared<MapArray>(type, offsets->length() - 1, std::move(buffers),
@@ -896,13 +898,13 @@ Status MapArray::ValidateChildData(
   if (pair_data->type->id() != Type::STRUCT) {
     return Status::Invalid("Map array child array should have struct type");
   }
-  if (pair_data->MayHaveNulls()) {
+  if (pair_data->GetNullCount() != 0) {
     return Status::Invalid("Map array child array should have no nulls");
   }
   if (pair_data->child_data.size() != 2) {
     return Status::Invalid("Map array child array should have two fields");
   }
-  if (pair_data->child_data[0]->MayHaveNulls()) {
+  if (pair_data->child_data[0]->GetNullCount() != 0) {
     return Status::Invalid("Map array keys array should have no nulls");
   }
   return Status::OK();
@@ -1001,13 +1003,57 @@ Result<std::shared_ptr<Array>> FixedSizeListArray::Flatten(
   return FlattenListArray(*this, memory_pool);
 }
 
+Result<std::shared_ptr<Tensor>> FixedSizeListArray::ToTensorWithNulls() const {
+  const auto* data = this->data().get();
+  auto type = this->type();
+  int64_t offset = data->offset;
+  int64_t length = data->length;
+  std::vector<int64_t> shape{length};
+
+  // Iterate over nested fixed length container types.
+  // Each nested container increase the tensor dimension.
+  while (type->id() == Type::FIXED_SIZE_LIST) {
+    const auto* fsl = internal::checked_cast<const FixedSizeListType*>(type.get());
+    type = fsl->value_type();
+    data = data->child_data.front().get();
+    // Overflow cannot happen on a valid array (its data needs to fit in memory,
+    // therefore be smaller than INT64_MAX)
+    offset = offset * fsl->list_size() + data->offset;
+    length = length * fsl->list_size();
+    shape.push_back(fsl->list_size());
+  }
+
+  // Only checking byte_width which we need here and leaving Tensor::Make error on
+  // unsupported types.
+  if (!is_fixed_width(*type)) {
+    return Status::TypeError("Expected a fixed width leaf type, got ", type->name());
+  }
+
+  std::shared_ptr<Buffer> buffer = nullptr;
+  if (const auto& buf = data->buffers[1]; buf != NULLPTR) {
+    const int64_t byte_width = type->byte_width();
+    // Buffer guarantees this fits into an int64_t.
+    const int64_t byte_offset = offset * byte_width;
+    const int64_t byte_length = length * byte_width;
+    ARROW_ASSIGN_OR_RAISE(buffer, SliceBufferSafe(buf, byte_offset, byte_length));
+  }
+
+  return Tensor::Make(std::move(type), std::move(buffer), std::move(shape));
+}
+
 // ----------------------------------------------------------------------
 // Struct
 
+struct StructArray::Impl {
+  mutable ArrayVector boxed_fields_;
+};
+
+StructArray::~StructArray() = default;
 StructArray::StructArray(const std::shared_ptr<ArrayData>& data) {
   ARROW_CHECK_EQ(data->type->id(), Type::STRUCT);
   SetData(data);
-  boxed_fields_.resize(data->child_data.size());
+  impl_ = std::make_unique<Impl>();
+  impl_->boxed_fields_.resize(data_->child_data.size());
 }
 
 StructArray::StructArray(const std::shared_ptr<DataType>& type, int64_t length,
@@ -1016,10 +1062,12 @@ StructArray::StructArray(const std::shared_ptr<DataType>& type, int64_t length,
                          int64_t offset) {
   ARROW_CHECK_EQ(type->id(), Type::STRUCT);
   SetData(ArrayData::Make(type, length, {std::move(null_bitmap)}, null_count, offset));
+  data_->child_data.reserve(children.size());
   for (const auto& child : children) {
     data_->child_data.push_back(child->data());
   }
-  boxed_fields_.resize(children.size());
+  impl_ = std::make_unique<Impl>();
+  impl_->boxed_fields_.resize(data_->child_data.size());
 }
 
 Result<std::shared_ptr<StructArray>> StructArray::Make(
@@ -1073,23 +1121,37 @@ const ArrayVector& StructArray::fields() const {
   for (int i = 0; i < num_fields(); ++i) {
     (void)field(i);
   }
-  return boxed_fields_;
+  return impl_->boxed_fields_;
 }
 
-const std::shared_ptr<Array>& StructArray::field(int i) const {
-  std::shared_ptr<Array> result = std::atomic_load(&boxed_fields_[i]);
-  if (!result) {
-    std::shared_ptr<ArrayData> field_data;
-    if (data_->offset != 0 || data_->child_data[i]->length != data_->length) {
-      field_data = data_->child_data[i]->Slice(data_->offset, data_->length);
-    } else {
-      field_data = data_->child_data[i];
-    }
-    result = MakeArray(field_data);
-    std::atomic_store(&boxed_fields_[i], std::move(result));
-    return boxed_fields_[i];
+std::shared_ptr<Array> StructArray::field(int i) const {
+  // Atomic ops on std::shared_ptr<T> are deprecated in C++20.  They should be
+  // replaced with std::atomic<std::shared_ptr<T>> but not all C++ standard
+  // libraries implement it yet. :-/
+  ARROW_SUPPRESS_DEPRECATION_WARNING
+  std::shared_ptr<Array> result = std::atomic_load(&impl_->boxed_fields_[i]);
+  ARROW_UNSUPPRESS_DEPRECATION_WARNING
+  if (result) {
+    return result;
   }
-  return boxed_fields_[i];
+  std::shared_ptr<ArrayData> field_data;
+  if (data_->offset != 0 || data_->child_data[i]->length != data_->length) {
+    field_data = data_->child_data[i]->Slice(data_->offset, data_->length);
+  } else {
+    field_data = data_->child_data[i];
+  }
+  result = MakeArray(field_data);
+  // Check if some other thread inserted the array in the meantime and return
+  // that in that case.
+  std::shared_ptr<Array> expected = nullptr;
+  ARROW_SUPPRESS_DEPRECATION_WARNING
+  const bool update_successful =
+      std::atomic_compare_exchange_strong(&impl_->boxed_fields_[i], &expected, result);
+  ARROW_UNSUPPRESS_DEPRECATION_WARNING
+  if (!update_successful) {
+    result = std::move(expected);
+  }
+  return result;
 }
 
 std::shared_ptr<Array> StructArray::GetFieldByName(const std::string& name) const {
@@ -1134,7 +1196,8 @@ Result<std::shared_ptr<Array>> StructArray::GetFlattenedField(int index,
   std::shared_ptr<Buffer> flattened_null_bitmap;
   int64_t flattened_null_count = kUnknownNullCount;
 
-  // Need to adjust for parent offset
+  // Push any non-trivial slicing on the parent to the child
+  // (including cases with offset = 0)
   if (data_->offset != 0 || data_->length != child_data->length) {
     child_data = child_data->Slice(data_->offset, data_->length);
   }
@@ -1177,6 +1240,13 @@ Result<std::shared_ptr<Array>> StructArray::GetFlattenedField(int index,
 // ----------------------------------------------------------------------
 // UnionArray
 
+struct UnionArray::Impl {
+  mutable ArrayVector boxed_fields_;
+};
+
+UnionArray::UnionArray() = default;
+UnionArray::~UnionArray() = default;
+
 void UnionArray::SetData(std::shared_ptr<ArrayData> data) {
   this->Array::SetData(std::move(data));
 
@@ -1184,7 +1254,8 @@ void UnionArray::SetData(std::shared_ptr<ArrayData> data) {
 
   ARROW_CHECK_GE(data_->buffers.size(), 2);
   raw_type_codes_ = data->GetValuesSafe<int8_t>(1);
-  boxed_fields_.resize(data_->child_data.size());
+  impl_ = std::make_unique<Impl>();
+  impl_->boxed_fields_.resize(data_->child_data.size());
 }
 
 void SparseUnionArray::SetData(std::shared_ptr<ArrayData> data) {
@@ -1207,6 +1278,8 @@ void DenseUnionArray::SetData(const std::shared_ptr<ArrayData>& data) {
 
   raw_value_offsets_ = data->GetValuesSafe<int32_t>(2);
 }
+
+SparseUnionArray::~SparseUnionArray() = default;
 
 SparseUnionArray::SparseUnionArray(std::shared_ptr<ArrayData> data) {
   SetData(std::move(data));
@@ -1260,6 +1333,8 @@ Result<std::shared_ptr<Array>> SparseUnionArray::GetFlattenedField(
   child_data->null_count = kUnknownNullCount;
   return MakeArray(child_data);
 }
+
+DenseUnionArray::~DenseUnionArray() = default;
 
 DenseUnionArray::DenseUnionArray(const std::shared_ptr<ArrayData>& data) {
   SetData(data);
@@ -1353,23 +1428,34 @@ Result<std::shared_ptr<Array>> SparseUnionArray::Make(
 }
 
 std::shared_ptr<Array> UnionArray::field(int i) const {
-  if (i < 0 ||
-      static_cast<decltype(boxed_fields_)::size_type>(i) >= boxed_fields_.size()) {
+  if (i < 0 || static_cast<size_t>(i) >= impl_->boxed_fields_.size()) {
     return nullptr;
   }
-  std::shared_ptr<Array> result = std::atomic_load(&boxed_fields_[i]);
-  if (!result) {
-    std::shared_ptr<ArrayData> child_data = data_->child_data[i]->Copy();
-    if (mode() == UnionMode::SPARSE) {
-      // Sparse union: need to adjust child if union is sliced
-      // (for dense unions, the need to lookup through the offsets
-      //  makes this unnecessary)
-      if (data_->offset != 0 || child_data->length > data_->length) {
-        child_data = child_data->Slice(data_->offset, data_->length);
-      }
+  ARROW_SUPPRESS_DEPRECATION_WARNING
+  std::shared_ptr<Array> result = std::atomic_load(&impl_->boxed_fields_[i]);
+  ARROW_UNSUPPRESS_DEPRECATION_WARNING
+  if (result) {
+    return result;
+  }
+  std::shared_ptr<ArrayData> child_data = data_->child_data[i]->Copy();
+  if (mode() == UnionMode::SPARSE) {
+    // Sparse union: need to adjust child if union is sliced
+    // (for dense unions, the need to lookup through the offsets
+    //  makes this unnecessary)
+    if (data_->offset != 0 || child_data->length > data_->length) {
+      child_data = child_data->Slice(data_->offset, data_->length);
     }
-    result = MakeArray(child_data);
-    std::atomic_store(&boxed_fields_[i], result);
+  }
+  result = MakeArray(child_data);
+  // Check if some other thread inserted the array in the meantime and return
+  // that in that case.
+  std::shared_ptr<Array> expected = nullptr;
+  ARROW_SUPPRESS_DEPRECATION_WARNING
+  const bool update_successful =
+      std::atomic_compare_exchange_strong(&impl_->boxed_fields_[i], &expected, result);
+  ARROW_UNSUPPRESS_DEPRECATION_WARNING
+  if (!update_successful) {
+    result = std::move(expected);
   }
   return result;
 }

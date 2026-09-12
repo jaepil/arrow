@@ -19,7 +19,7 @@
 #include <memory>
 #include <string>
 #include "arrow/compute/api_vector.h"
-#include "arrow/compute/kernels/test_util.h"
+#include "arrow/compute/kernels/test_util_internal.h"
 #include "arrow/compute/registry.h"
 #include "arrow/compute/type_fwd.h"
 #include "arrow/testing/gtest_util.h"
@@ -148,6 +148,26 @@ TEST_F(TestPairwiseDiff, Numeric) {
       auto output = ArrayFromJSON(output_type, "[2, null, 2, null, null, null, null]");
       CheckVectorUnary("pairwise_diff", input, output, &options);
     }
+  }
+}
+
+TEST_F(TestPairwiseDiff, SlicedInput) {
+  // Slice() keeps a nonzero offset into the parent buffer. The kernel
+  // used to treat that offset as zero and read values before the slice.
+  auto base = ArrayFromJSON(int64(), "[99, 1, 4, 9, 16, 88]");
+  auto sliced = base->Slice(1, 4);
+
+  {
+    PairwiseOptions options(1);
+    auto expected = ArrayFromJSON(int64(), "[null, 3, 5, 7]");
+    CheckVectorUnary("pairwise_diff", sliced, expected, &options);
+    CheckVectorUnary("pairwise_diff_checked", sliced, expected, &options);
+  }
+  {
+    PairwiseOptions options(-1);
+    auto expected = ArrayFromJSON(int64(), "[-3, -5, -7, null]");
+    CheckVectorUnary("pairwise_diff", sliced, expected, &options);
+    CheckVectorUnary("pairwise_diff_checked", sliced, expected, &options);
   }
 }
 

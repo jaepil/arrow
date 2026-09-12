@@ -15,40 +15,43 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <span>
+
 #include "parquet/encryption/encryption_internal.h"
 #include "parquet/exception.h"
 
 namespace parquet::encryption {
+
+namespace {
 
 void ThrowOpenSSLRequiredException() {
   throw ParquetException(
       "Calling encryption method in Arrow/Parquet built without OpenSSL");
 }
 
+}  // namespace
+
 class AesEncryptor::AesEncryptorImpl {};
 
 AesEncryptor::~AesEncryptor() {}
 
-int32_t AesEncryptor::SignedFooterEncrypt(::arrow::util::span<const uint8_t> footer,
-                                          ::arrow::util::span<const uint8_t> key,
-                                          ::arrow::util::span<const uint8_t> aad,
-                                          ::arrow::util::span<const uint8_t> nonce,
-                                          ::arrow::util::span<uint8_t> encrypted_footer) {
+int32_t AesEncryptor::SignedFooterEncrypt(std::span<const uint8_t> footer,
+                                          std::span<const uint8_t> key,
+                                          std::span<const uint8_t> aad,
+                                          std::span<const uint8_t> nonce,
+                                          std::span<uint8_t> encrypted_footer) {
   ThrowOpenSSLRequiredException();
   return -1;
 }
-
-void AesEncryptor::WipeOut() { ThrowOpenSSLRequiredException(); }
 
 int32_t AesEncryptor::CiphertextLength(int64_t plaintext_len) const {
   ThrowOpenSSLRequiredException();
   return -1;
 }
 
-int32_t AesEncryptor::Encrypt(::arrow::util::span<const uint8_t> plaintext,
-                              ::arrow::util::span<const uint8_t> key,
-                              ::arrow::util::span<const uint8_t> aad,
-                              ::arrow::util::span<uint8_t> ciphertext) {
+int32_t AesEncryptor::Encrypt(std::span<const uint8_t> plaintext,
+                              std::span<const uint8_t> key, std::span<const uint8_t> aad,
+                              std::span<uint8_t> ciphertext) {
   ThrowOpenSSLRequiredException();
   return -1;
 }
@@ -60,23 +63,14 @@ AesEncryptor::AesEncryptor(ParquetCipher::type alg_id, int32_t key_len, bool met
 
 class AesDecryptor::AesDecryptorImpl {};
 
-int32_t AesDecryptor::Decrypt(::arrow::util::span<const uint8_t> ciphertext,
-                              ::arrow::util::span<const uint8_t> key,
-                              ::arrow::util::span<const uint8_t> aad,
-                              ::arrow::util::span<uint8_t> plaintext) {
+int32_t AesDecryptor::Decrypt(std::span<const uint8_t> ciphertext,
+                              std::span<const uint8_t> key, std::span<const uint8_t> aad,
+                              std::span<uint8_t> plaintext) {
   ThrowOpenSSLRequiredException();
   return -1;
 }
 
-void AesDecryptor::WipeOut() { ThrowOpenSSLRequiredException(); }
-
 AesDecryptor::~AesDecryptor() {}
-
-std::unique_ptr<AesEncryptor> AesEncryptor::Make(ParquetCipher::type alg_id,
-                                                 int32_t key_len, bool metadata) {
-  ThrowOpenSSLRequiredException();
-  return NULLPTR;
-}
 
 std::unique_ptr<AesEncryptor> AesEncryptor::Make(ParquetCipher::type alg_id,
                                                  int32_t key_len, bool metadata,
@@ -90,9 +84,8 @@ AesDecryptor::AesDecryptor(ParquetCipher::type alg_id, int32_t key_len, bool met
   ThrowOpenSSLRequiredException();
 }
 
-std::shared_ptr<AesDecryptor> AesDecryptor::Make(
-    ParquetCipher::type alg_id, int32_t key_len, bool metadata,
-    std::vector<std::weak_ptr<AesDecryptor>>* all_decryptors) {
+std::unique_ptr<AesDecryptor> AesDecryptor::Make(ParquetCipher::type alg_id,
+                                                 int32_t key_len, bool metadata) {
   ThrowOpenSSLRequiredException();
   return NULLPTR;
 }

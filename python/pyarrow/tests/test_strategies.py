@@ -16,6 +16,7 @@
 # under the License.
 
 import hypothesis as h
+import hypothesis.strategies as st
 
 import pytest
 
@@ -44,13 +45,21 @@ def test_arrays(array):
     assert isinstance(array, pa.lib.Array)
 
 
+@h.given(st.sampled_from(['+01:30', '-00:30']), st.data())
+def test_timestamp_array_fixed_offset_timezones(timezone, data):
+    array = data.draw(
+        past.arrays(st.just(pa.timestamp('s', timezone)), size=1))
+    assert isinstance(array, pa.lib.Array)
+    assert array.type.tz == timezone
+
+
 @pytest.mark.numpy
 @h.given(past.arrays(past.primitive_types, nullable=False))
 def test_array_nullability(array):
     assert array.null_count == 0
 
 
-@h.given(past.all_chunked_arrays)
+@h.given(past.chunked_arrays(past.primitive_types))
 def test_chunked_arrays(chunked_array):
     assert isinstance(chunked_array, pa.lib.ChunkedArray)
 

@@ -17,7 +17,7 @@
 
 int_types <- c(int8(), int16(), int32(), int64())
 uint_types <- c(uint8(), uint16(), uint32(), uint64())
-float_types <- c(float32(), float64()) # float16() not really supported in C++ yet
+float_types <- c(float16(), float32(), float64())
 all_numeric_types <- c(int_types, uint_types, float_types)
 
 expect_chunked_roundtrip <- function(x, type) {
@@ -245,11 +245,28 @@ test_that("ChunkedArray supports difftime", {
 
 test_that("ChunkedArray supports empty arrays (ARROW-13761)", {
   types <- c(
-    int8(), int16(), int32(), int64(), uint8(), uint16(), uint32(),
-    uint64(), float32(), float64(), timestamp("ns"), binary(),
-    large_binary(), fixed_size_binary(32), date32(), date64(),
-    decimal128(4, 2), decimal256(4, 2),
-    dictionary(), struct(x = int32())
+    int8(),
+    int16(),
+    int32(),
+    int64(),
+    uint8(),
+    uint16(),
+    uint32(),
+    uint64(),
+    float32(),
+    float64(),
+    timestamp("ns"),
+    binary(),
+    large_binary(),
+    fixed_size_binary(32),
+    date32(),
+    date64(),
+    decimal32(4, 2),
+    decimal64(4, 2),
+    decimal128(4, 2),
+    decimal256(4, 2),
+    dictionary(),
+    struct(x = int32())
   )
 
   empty_filter <- ChunkedArray$create(type = bool())
@@ -374,9 +391,7 @@ test_that("ChunkedArray$View() (ARROW-6542)", {
   b <- a$View(float32())
   expect_equal(b$type, float32())
   expect_equal(length(b), 7L)
-  expect_true(all(
-    sapply(b$chunks, function(.x) .x$type == float32())
-  ))
+  expect_all_true(sapply(b$chunks, function(.x) .x$type == float32()))
   # Input validation
   expect_error(a$View("not a type"), "type must be a DataType, not character")
 })
@@ -463,16 +478,14 @@ test_that("Converting a chunked array unifies factors (ARROW-8374)", {
 })
 
 test_that("Handling string data with embedded nuls", {
-  raws <- structure(list(
+  raws <- blob::as_blob(list(
     as.raw(c(0x70, 0x65, 0x72, 0x73, 0x6f, 0x6e)),
     as.raw(c(0x77, 0x6f, 0x6d, 0x61, 0x6e)),
     as.raw(c(0x6d, 0x61, 0x00, 0x6e)), # <-- there's your nul, 0x00
     as.raw(c(0x66, 0x00, 0x00, 0x61, 0x00, 0x6e)), # multiple nuls
     as.raw(c(0x63, 0x61, 0x6d, 0x65, 0x72, 0x61)),
     as.raw(c(0x74, 0x76))
-  ),
-  class = c("arrow_binary", "vctrs_vctr", "list")
-  )
+  ))
   chunked_array_with_nul <- ChunkedArray$create(raws)$cast(utf8())
 
   v <- expect_error(as.vector(chunked_array_with_nul), NA)
@@ -535,4 +548,16 @@ test_that("as_chunked_array() works for Array", {
     as_chunked_array(Array$create(1:6), type = float64()),
     chunked_array(Array$create(1:6, type = float64()))
   )
+})
+
+test_that("float16 values roundtrip to R correctly", {
+  # Values exactly representable in half-float, so the roundtrip is exact.
+  # Regression test for GH-50378 (values were previously decoded as raw uint16 bits)
+  x <- c(1, 2, 3.5, NA, -0.25, 1024, Inf)
+  a <- chunked_array(x[1:4], x[5:7], type = float16())
+  expect_type_equal(a$type, float16())
+  expect_identical(a$num_chunks, 2L)
+  expect_as_vector(a, x)
+  expect_as_vector(a$chunk(1), x[5:7])
+  expect_as_vector(a$Slice(1), x[-1])
 })

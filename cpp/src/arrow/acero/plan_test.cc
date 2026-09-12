@@ -27,6 +27,7 @@
 #include "arrow/acero/util.h"
 #include "arrow/compute/exec.h"
 #include "arrow/compute/expression.h"
+#include "arrow/compute/test_util_internal.h"
 #include "arrow/io/util_internal.h"
 #include "arrow/record_batch.h"
 #include "arrow/table.h"
@@ -51,8 +52,10 @@ using testing::UnorderedElementsAreArray;
 
 namespace arrow {
 
+using compute::ArgShape;
 using compute::call;
 using compute::CountOptions;
+using compute::ExecBatchFromJSON;
 using compute::field_ref;
 using compute::ScalarAggregateOptions;
 using compute::SortKey;
@@ -515,7 +518,7 @@ TEST(ExecPlan, ToString) {
   });
   ASSERT_OK_AND_ASSIGN(std::string plan_str, DeclarationToString(declaration));
   EXPECT_EQ(plan_str, R"a(ExecPlan with 6 nodes:
-custom_sink_label:OrderBySinkNode{by={sort_keys=[FieldRef.Name(sum(multiply(i32, 2))) ASC], null_placement=AtEnd}}
+custom_sink_label:OrderBySinkNode{by={sort_keys=[FieldRef.Name(sum(multiply(i32, 2))) ASC NULLS LAST]}}
   :FilterNode{filter=(sum(multiply(i32, 2)) > 10)}
     :GroupByNode{keys=["bool"], aggregates=[
     	hash_sum(multiply(i32, 2)),
@@ -1261,6 +1264,23 @@ TEST(ExecPlanExecution, SourceFilterProjectGroupedSumFilter) {
     ASSERT_OK_AND_ASSIGN(auto actual, DeclarationToTable(std::move(plan), parallel));
     AssertTablesEqualIgnoringOrder(expected, actual);
   }
+}
+
+TEST(ExecPlanExecution, ProjectNamesSizeMismatch) {
+  auto input = MakeGroupableBatches();
+
+  Declaration plan = Declaration::Sequence(
+      {{"source", SourceNodeOptions{input.schema, input.gen(true, /*slow=*/false)}},
+       {"project", ProjectNodeOptions{
+                       /*expressions=*/{field_ref("str"),
+                                        call("multiply", {field_ref("i32"), literal(2)})},
+                       /*names=*/{"a"}}}});  // expected 2 names but only 1 provided
+
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid,
+      ::testing::HasSubstr(
+          "Project node's size of names 1 doesn't match size of expressions 2"),
+      DeclarationToTable(std::move(plan)));
 }
 
 TEST(ExecPlanExecution, SourceFilterProjectGroupedSumOrderBy) {

@@ -21,6 +21,18 @@ class ColumnTest < Test::Unit::TestCase
     @column = table.visible
   end
 
+  test("#to_arrow") do
+    assert_equal(@column.data, @column.to_arrow)
+  end
+
+  test("#to_arrow_array") do
+    assert_equal(@column.data.chunks[0], @column.to_arrow_chunked_array)
+  end
+
+  test("#to_arrow_chunked_array") do
+    assert_equal(@column.data, @column.to_arrow_chunked_array)
+  end
+
   test("#name") do
     assert_equal("visible", @column.name)
   end
@@ -47,6 +59,14 @@ class ColumnTest < Test::Unit::TestCase
 
   test("#reverse_each") do
     assert_equal([false, nil, true], @column.reverse_each.to_a)
+  end
+
+  test("#size") do
+    assert_equal(3, @column.size)
+  end
+
+  test("#length") do
+    assert_equal(3, @column.length)
   end
 
   test("#n_rows") do

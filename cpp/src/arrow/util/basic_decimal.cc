@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
@@ -33,7 +34,7 @@
 #include "arrow/util/endian.h"
 #include "arrow/util/int128_internal.h"
 #include "arrow/util/int_util_overflow.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 
 namespace arrow {
@@ -49,6 +50,11 @@ static constexpr uint64_t kInt64Mask = 0xFFFFFFFFFFFFFFFF;
 #else
 static constexpr uint64_t kInt32Mask = 0xFFFFFFFF;
 #endif
+
+BasicDecimal32& BasicDecimal32::Negate() {
+  value_ = arrow::internal::SafeSignedNegate(value_);
+  return *this;
+}
 
 DecimalStatus BasicDecimal32::Divide(const BasicDecimal32& divisor,
                                      BasicDecimal32* result,
@@ -152,6 +158,11 @@ BasicDecimal32::operator BasicDecimal64() const {
   return BasicDecimal64(static_cast<int64_t>(value()));
 }
 
+BasicDecimal64& BasicDecimal64::Negate() {
+  value_ = arrow::internal::SafeSignedNegate(value_);
+  return *this;
+}
+
 DecimalStatus BasicDecimal64::Divide(const BasicDecimal64& divisor,
                                      BasicDecimal64* result,
                                      BasicDecimal64* remainder) const {
@@ -253,12 +264,18 @@ const BasicDecimal64& BasicDecimal64::GetHalfScaleMultiplier(int32_t scale) {
 bool BasicDecimal32::FitsInPrecision(int32_t precision) const {
   DCHECK_GE(precision, 0);
   DCHECK_LE(precision, kMaxPrecision);
+  if (value_ == INT32_MIN) {
+    return false;
+  }
   return Abs(*this) < DecimalTraits<BasicDecimal32>::powers_of_ten()[precision];
 }
 
 bool BasicDecimal64::FitsInPrecision(int32_t precision) const {
   DCHECK_GE(precision, 0);
   DCHECK_LE(precision, kMaxPrecision);
+  if (value_ == INT64_MIN) {
+    return false;
+  }
   return Abs(*this) < DecimalTraits<BasicDecimal64>::powers_of_ten()[precision];
 }
 
@@ -372,7 +389,7 @@ BasicDecimal64 operator%(const BasicDecimal64& left, const BasicDecimal64& right
 
 template <typename BaseType>
 int32_t SmallBasicDecimal<BaseType>::CountLeadingBinaryZeros() const {
-  return bit_util::CountLeadingZeros(static_cast<std::make_unsigned_t<BaseType>>(value_));
+  return std::countl_zero(static_cast<std::make_unsigned_t<BaseType>>(value_));
 }
 
 // same as kDecimal128PowersOfTen[38] - 1
@@ -876,7 +893,7 @@ static inline DecimalStatus DecimalDivide(const DecimalClass& dividend,
   // Normalize by shifting both by a multiple of 2 so that
   // the digit guessing is better. The requirement is that
   // divisor_array[0] is greater than 2**31.
-  int64_t normalize_bits = bit_util::CountLeadingZeros(divisor_array[0]);
+  int64_t normalize_bits = std::countl_zero(divisor_array[0]);
   ShiftArrayLeft(divisor_array, divisor_length, normalize_bits);
   ShiftArrayLeft(dividend_array, dividend_length, normalize_bits);
 
@@ -1139,9 +1156,9 @@ int32_t BasicDecimal128::CountLeadingBinaryZeros() const {
   DCHECK_GE(*this, BasicDecimal128(0));
 
   if (high_bits() == 0) {
-    return bit_util::CountLeadingZeros(low_bits()) + 64;
+    return std::countl_zero(low_bits()) + 64;
   } else {
-    return bit_util::CountLeadingZeros(static_cast<uint64_t>(high_bits()));
+    return std::countl_zero(static_cast<uint64_t>(high_bits()));
   }
 }
 

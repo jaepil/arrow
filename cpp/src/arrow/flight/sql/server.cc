@@ -31,6 +31,7 @@
 #include "arrow/flight/sql/sql_info_internal.h"
 #include "arrow/type.h"
 #include "arrow/util/checked_cast.h"
+#include "arrow/util/macros.h"
 
 #define PROPERTY_TO_OPTIONAL(COMMAND, PROPERTY) \
   COMMAND.has_##PROPERTY() ? std::make_optional(COMMAND.PROPERTY()) : std::nullopt
@@ -337,6 +338,8 @@ arrow::Result<ActionBeginTransactionRequest> ParseActionBeginTransactionRequest(
   return result;
 }
 
+// ActionCancelQueryRequest is deprecated
+ARROW_SUPPRESS_DEPRECATION_WARNING
 arrow::Result<ActionCancelQueryRequest> ParseActionCancelQueryRequest(
     const Action& action) {
   pb::sql::ActionCancelQueryRequest command;
@@ -346,6 +349,7 @@ arrow::Result<ActionCancelQueryRequest> ParseActionCancelQueryRequest(
   ARROW_ASSIGN_OR_RAISE(result.info, FlightInfo::Deserialize(command.info()));
   return result;
 }
+ARROW_UNSUPPRESS_DEPRECATION_WARNING
 
 arrow::Result<ActionCreatePreparedStatementRequest>
 ParseActionCreatePreparedStatementRequest(const Action& action) {
@@ -468,6 +472,8 @@ arrow::Result<Result> PackActionResult(const FlightEndpoint& endpoint) {
   return endpoint.SerializeToBuffer();
 }
 
+// ActionCancelQueryResult is deprecated
+ARROW_SUPPRESS_DEPRECATION_WARNING
 arrow::Result<Result> PackActionResult(CancelResult result) {
   pb::sql::ActionCancelQueryResult pb_result;
   switch (result) {
@@ -487,6 +493,7 @@ arrow::Result<Result> PackActionResult(CancelResult result) {
   }
   return PackActionResult(pb_result);
 }
+ARROW_UNSUPPRESS_DEPRECATION_WARNING
 
 arrow::Result<Result> PackActionResult(ActionCreatePreparedStatementResult result) {
   pb::sql::ActionCreatePreparedStatementResult pb_result;
@@ -530,7 +537,13 @@ arrow::Result<std::string> CreateStatementQueryTicket(
   ticket_statement_query.set_statement_handle(statement_handle);
 
   google::protobuf::Any ticket;
+#if PROTOBUF_VERSION >= 3015000
+  if (!ticket.PackFrom(ticket_statement_query)) {
+    return Status::IOError("Failed to pack ticket");
+  }
+#else
   ticket.PackFrom(ticket_statement_query);
+#endif
 
   std::string ticket_string;
 
@@ -1307,7 +1320,7 @@ const std::shared_ptr<Schema>& SqlSchema::GetPrimaryKeysSchema() {
   return kSchema;
 }
 
-const std::shared_ptr<Schema>& GetImportedExportedKeysAndCrossReferenceSchema() {
+static const std::shared_ptr<Schema>& GetImportedExportedKeysAndCrossReferenceSchema() {
   static std::shared_ptr<Schema> kSchema = arrow::schema(
       {field("pk_catalog_name", utf8(), true), field("pk_db_schema_name", utf8(), true),
        field("pk_table_name", utf8(), false), field("pk_column_name", utf8(), false),

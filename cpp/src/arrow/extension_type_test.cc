@@ -38,11 +38,11 @@
 #include "arrow/testing/gtest_util.h"
 #include "arrow/type.h"
 #include "arrow/util/key_value_metadata.h"
-#include "arrow/util/logging.h"
-
-namespace arrow {
+#include "arrow/util/logging_internal.h"
 
 using arrow::ipc::test::RoundtripBatch;
+
+namespace arrow {
 
 class Parametric1Array : public ExtensionArray {
  public:

@@ -17,15 +17,14 @@
 
 #include <string_view>
 
+#include "arrow/buffer.h"
 #include "arrow/filesystem/filesystem.h"
 #include "arrow/filesystem/path_util.h"
-#include "arrow/json/object_parser.h"
-#include "arrow/json/object_writer.h"
 #include "arrow/result.h"
+#include "arrow/util/simdjson_internal.h"
 
 #include "parquet/encryption/file_system_key_material_store.h"
 #include "parquet/encryption/key_material.h"
-#include "parquet/exception.h"
 
 namespace parquet::encryption {
 
@@ -34,13 +33,14 @@ constexpr const char FileSystemKeyMaterialStore::kTempFilePrefix[];
 constexpr const char FileSystemKeyMaterialStore::kKeyMaterialFileSuffix[];
 
 FileSystemKeyMaterialStore::FileSystemKeyMaterialStore(
-    const std::string& key_material_file_path,
-    const std::shared_ptr<::arrow::fs::FileSystem>& file_system)
-    : key_material_file_path_{key_material_file_path}, file_system_{file_system} {}
+    std::string key_material_file_path,
+    std::shared_ptr<::arrow::fs::FileSystem> file_system)
+    : key_material_file_path_{std::move(key_material_file_path)},
+      file_system_{std::move(file_system)} {}
 
 std::shared_ptr<FileSystemKeyMaterialStore> FileSystemKeyMaterialStore::Make(
-    const std::string& parquet_file_path,
-    const std::shared_ptr<::arrow::fs::FileSystem>& file_system, bool use_tmp_prefix) {
+    std::string parquet_file_path, std::shared_ptr<::arrow::fs::FileSystem> file_system,
+    bool use_tmp_prefix) {
   if (parquet_file_path.empty()) {
     throw ParquetException(
         "The Parquet file path must be specified when using external key material");
@@ -50,7 +50,7 @@ std::shared_ptr<FileSystemKeyMaterialStore> FileSystemKeyMaterialStore::Make(
         "A file system must be specified when using external key material");
   }
 
-  ::arrow::fs::FileInfo file_info(parquet_file_path);
+  ::arrow::fs::FileInfo file_info(std::move(parquet_file_path));
   std::stringstream key_material_file_name;
   if (use_tmp_prefix) {
     key_material_file_name << FileSystemKeyMaterialStore::kTempFilePrefix;
@@ -61,8 +61,8 @@ std::shared_ptr<FileSystemKeyMaterialStore> FileSystemKeyMaterialStore::Make(
 
   std::string key_material_file_path = ::arrow::fs::internal::ConcatAbstractPath(
       file_info.dir_name(), key_material_file_name.str());
-  return std::make_shared<FileSystemKeyMaterialStore>(key_material_file_path,
-                                                      file_system);
+  return std::make_shared<FileSystemKeyMaterialStore>(std::move(key_material_file_path),
+                                                      std::move(file_system));
 }
 
 void FileSystemKeyMaterialStore::LoadKeyMaterialMap() {
@@ -73,18 +73,21 @@ void FileSystemKeyMaterialStore::LoadKeyMaterialMap() {
   PARQUET_ASSIGN_OR_THROW(input_size, input->GetSize());
   PARQUET_ASSIGN_OR_THROW(buff, input->ReadAt(0, input_size));
   std::string buff_str = buff->ToString();
-  ::arrow::json::internal::ObjectParser parser;
+  ::arrow::internal::JsonObjectParser parser;
   auto status = parser.Parse(buff_str);
   PARQUET_THROW_NOT_OK(status);
   PARQUET_ASSIGN_OR_THROW(key_material_map_, parser.GetStringMap());
 }
 
 std::string FileSystemKeyMaterialStore::BuildKeyMaterialMapJson() {
-  ::arrow::json::internal::ObjectWriter writer;
+  ::arrow::internal::JsonWriter writer;
+  writer.StartObject();
   for (const auto& it : key_material_map_) {
-    writer.SetString(it.first, it.second);
+    writer.StringField(it.first, it.second);
   }
-  return writer.Serialize();
+  writer.EndObject();
+  PARQUET_ASSIGN_OR_THROW(std::string_view json, writer.GetString());
+  return std::string(json);
 }
 
 void FileSystemKeyMaterialStore::SaveMaterial() {

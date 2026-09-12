@@ -19,6 +19,11 @@
 
 {{ macros.github_header() }}
 
+permissions:
+  contents: read
+  # For OIDC token for sccache
+  id-token: write
+
 jobs:
   test:
     name: |
@@ -31,6 +36,7 @@ jobs:
       {{ macros.github_free_space()|indent }}
       {{ macros.github_install_archery()|indent }}
 
+      {{ macros.github_configure_aws_credentials()|indent }}
       - name: Execute Docker Build
         shell: bash
         env:
@@ -66,7 +72,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-output
-          path: arrow/r/check/arrow.Rcheck/tests/testthat.Rout*
+          path: |
+            arrow/r/tests/
+            arrow/r/arrow.Rcheck/
+            !arrow/r/arrow.Rcheck/00_pkg_src/
+            !arrow/r/arrow.Rcheck/arrow/
           if-no-files-found: ignore
 
     {% if arrow.is_default_branch() %}

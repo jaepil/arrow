@@ -23,13 +23,11 @@
 #include "arrow/filesystem/util_internal.h"
 #include "arrow/result.h"
 #include "arrow/status.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/string.h"
 #include "arrow/util/uri.h"
 
 namespace arrow {
-
-using internal::StartsWith;
 
 namespace fs {
 namespace internal {
@@ -236,7 +234,7 @@ bool IsAncestorOf(std::string_view ancestor, std::string_view descendant) {
   }
 
   descendant = RemoveTrailingSlash(descendant);
-  if (!StartsWith(descendant, ancestor)) {
+  if (!descendant.starts_with(ancestor)) {
     // an ancestor path is a prefix of descendant paths
     return false;
   }
@@ -249,7 +247,7 @@ bool IsAncestorOf(std::string_view ancestor, std::string_view descendant) {
   }
 
   // "/hello/w" is not an ancestor of "/hello/world"
-  return StartsWith(descendant, std::string{kSep});
+  return descendant.starts_with(std::string{kSep});
 }
 
 std::optional<std::string_view> RemoveAncestor(std::string_view ancestor,

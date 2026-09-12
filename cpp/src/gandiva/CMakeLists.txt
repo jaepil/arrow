@@ -25,6 +25,15 @@ add_custom_target(gandiva-benchmarks)
 
 add_dependencies(gandiva-all gandiva gandiva-tests gandiva-benchmarks)
 
+# If libgandiva.a is only built, "pkg-config --cflags --libs
+# arrow-flight" outputs build flags for static linking not shared
+# linking. GANDIVA_PC_* except GANDIVA_PC_*_PRIVATE are for the static
+# linking case.
+if(NOT ARROW_BUILD_SHARED AND ARROW_BUILD_STATIC)
+  string(APPEND GANDIVA_PC_CFLAGS "${GANDIVA_PC_CFLAGS_PRIVATE}")
+  set(GANDIVA_PC_CFLAGS_PRIVATE "")
+endif()
+
 include(GandivaAddBitcode)
 
 find_package(LLVMAlt REQUIRED)
@@ -106,10 +115,8 @@ set(GANDIVA_STATIC_LINK_LIBS
     LLVM::LLVM_LIBS
     ${GANDIVA_OPENSSL_LIBS}
     Boost::headers)
-if(ARROW_USE_XSIMD)
-  list(APPEND GANDIVA_SHARED_PRIVATE_LINK_LIBS ${ARROW_XSIMD})
-  list(APPEND GANDIVA_STATIC_LINK_LIBS ${ARROW_XSIMD})
-endif()
+list(APPEND GANDIVA_SHARED_PRIVATE_LINK_LIBS ${ARROW_XSIMD})
+list(APPEND GANDIVA_STATIC_LINK_LIBS ${ARROW_XSIMD})
 if(ARROW_WITH_RE2)
   list(APPEND GANDIVA_SHARED_PRIVATE_LINK_LIBS re2::re2)
   list(APPEND GANDIVA_STATIC_LINK_LIBS re2::re2)
@@ -144,8 +151,6 @@ add_arrow_lib(gandiva
               gandiva
               SOURCES
               ${SRC_FILES}
-              PRECOMPILED_HEADERS
-              "$<$<COMPILE_LANGUAGE:CXX>:gandiva/pch.h>"
               OUTPUTS
               GANDIVA_LIBRARIES
               DEPENDENCIES
@@ -188,8 +193,8 @@ if(WIN32)
   list(APPEND GANDIVA_STATIC_TEST_LINK_LIBS ${GANDIVA_OPENSSL_LIBS})
   list(APPEND GANDIVA_SHARED_TEST_LINK_LIBS ${GANDIVA_OPENSSL_LIBS})
 endif()
-list(APPEND GANDIVA_STATIC_TEST_LINK_LIBS ${ARROW_GTEST_GMOCK} ${ARROW_GTEST_GTEST_MAIN})
-list(APPEND GANDIVA_SHARED_TEST_LINK_LIBS ${ARROW_GTEST_GMOCK} ${ARROW_GTEST_GTEST_MAIN})
+list(APPEND GANDIVA_STATIC_TEST_LINK_LIBS ${ARROW_GTEST_GMOCK_MAIN})
+list(APPEND GANDIVA_SHARED_TEST_LINK_LIBS ${ARROW_GTEST_GMOCK_MAIN})
 
 function(ADD_GANDIVA_TEST REL_TEST_NAME)
   set(options USE_STATIC_LINKING)
@@ -267,6 +272,7 @@ add_gandiva_test(internals-test
                  hash_utils_test.cc
                  gdv_function_stubs_test.cc
                  interval_holder_test.cc
+                 target_datalayout_test.cc
                  tests/test_util.cc
                  EXTRA_LINK_LIBS
                  re2::re2

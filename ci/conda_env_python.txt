@@ -15,16 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# don't add pandas here, because it is not a mandatory test dependency
-boto3  # not a direct dependency of s3fs, but needed for our s3fs fixture
+# Don't add pandas here, because it is not a mandatory test dependency
+
+# Not a direct dependency of s3fs, but needed for our s3fs fixture
+boto3
 cffi
-cython>=0.29.31
+cython>=3.1
 cloudpickle
 fsspec
 hypothesis
-numpy>=1.16.6
+libcst>=1.8.6
+numpy>=2.0
 pytest
 pytest-faulthandler
 s3fs>=2023.10.0
-setuptools>=64
+scikit-build-core>=1.0
 setuptools_scm>=8

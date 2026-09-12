@@ -15,30 +15,30 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import os
-import re
 import fnmatch
 import glob
-import time
 import logging
 import mimetypes
+import os
+import re
 import subprocess
 import textwrap
+import time
 import uuid
+import warnings
+from datetime import date
 from io import StringIO
 from pathlib import Path
-from datetime import date
-import warnings
 
 import jinja2
 from ruamel.yaml import YAML
 
 try:
-    import github3
-    _have_github3 = True
+    from github import Github, GithubException
+    from github import Auth as GithubAuth
+    _have_github = True
 except ImportError:
-    github3 = object
-    _have_github3 = False
+    _have_github = False
 
 try:
     import pygit2
@@ -52,7 +52,7 @@ else:
 from ..utils.source import ArrowSources
 
 
-for pkg in ["requests", "urllib3", "github3"]:
+for pkg in ["requests", "urllib3", "github"]:
     logging.getLogger(pkg).setLevel(logging.WARNING)
 
 logger = logging.getLogger("crossbow")
@@ -269,8 +269,8 @@ class Repo:
     def origin(self):
         remote = self.repo.remotes['origin']
         if self.require_https and remote.url.startswith('git@github.com'):
-            raise CrossbowError("Change SSH origin URL to HTTPS to use "
-                                "Crossbow: {}".format(remote.url))
+            raise CrossbowError(f"Change SSH origin URL to HTTPS to use "
+                                f"Crossbow: {remote.url}")
         return remote
 
     def fetch(self, retry=3):
@@ -291,7 +291,7 @@ class Repo:
         if github_token is None:
             raise RuntimeError(
                 'Could not determine GitHub token. Please set the '
-                'CROSSBOW_GITHUB_TOKEN environment variable to a '
+                'CROSSBOW_GITHUB_TOKEN or GH_TOKEN environment variable to a '
                 'valid GitHub access token or pass one to --github-token.'
             )
         callbacks = GitRemoteCallbacks(github_token)
@@ -299,9 +299,9 @@ class Repo:
         try:
             self.origin.push(refs + self._updated_refs, callbacks=callbacks)
         except pygit2.GitError:
-            raise RuntimeError('Failed to push updated references, '
-                               'potentially because of credential issues: {}'
-                               .format(self._updated_refs))
+            raise RuntimeError("Failed to push updated references, "
+                               "potentially because of credential issues: "
+                               f"{self._updated_refs}")
         else:
             self.updated_refs = []
 
@@ -329,9 +329,9 @@ class Repo:
             return self.repo.remotes[self.branch.upstream.remote_name]
         except (AttributeError, KeyError):
             raise CrossbowError(
-                'Cannot determine git remote for the Arrow repository to '
-                'clone or push to, try to push the `{}` branch first to have '
-                'a remote tracking counterpart.'.format(self.branch.name)
+                "Cannot determine git remote for the Arrow repository to "
+                f"clone or push to, try to push the `{self.branch.name}` "
+                "branch first to have a remote tracking counterpart."
             )
 
     @property
@@ -422,7 +422,7 @@ class Repo:
         branch = self.repo.create_branch(branch_name, commit)
 
         # append to the pushable references
-        self._updated_refs.append('refs/heads/{}'.format(branch_name))
+        self._updated_refs.append(f"refs/heads/{branch_name}")
 
         return branch
 
@@ -438,7 +438,7 @@ class Repo:
                                       message)
 
         # append to the pushable references
-        self._updated_refs.append('refs/tags/{}'.format(tag_name))
+        self._updated_refs.append(f"refs/tags/{tag_name}")
 
         return self.repo[tag_id]
 
@@ -448,52 +448,50 @@ class Repo:
         blob = self.repo[entry.id]
         return blob.data
 
-    def _github_login(self, github_token):
-        """Returns a logged in github3.GitHub instance"""
-        if not _have_github3:
-            raise ImportError('Must install github3.py')
+    def _github_login(self, github_token=None):
+        """Returns a Github instance, optionally authenticated with a token"""
+        if not _have_github:
+            raise ImportError('Must install PyGithub')
         github_token = github_token or self.github_token
-        session = github3.session.GitHubSession(
-            default_connect_timeout=10,
-            default_read_timeout=30
-        )
-        github = github3.GitHub(session=session)
-        github.login(token=github_token)
-        return github
+        if not github_token:
+            return Github(timeout=30)
+        return Github(auth=GithubAuth.Token(github_token), timeout=30)
 
     def as_github_repo(self, github_token=None):
         """Converts it to a repository object which wraps the GitHub API"""
         if self._github_repo is None:
             github = self._github_login(github_token)
             username, reponame = _parse_github_user_repo(self.remote_url)
-            self._github_repo = github.repository(username, reponame)
+            self._github_repo = github.get_repo(f"{username}/{reponame}")
         return self._github_repo
 
     def token_expiration_date(self, github_token=None):
         """Returns the expiration date for the github_token provided"""
         github = self._github_login(github_token)
-        # github3 hides the headers from us. Use the _get method
-        # to access the response headers.
-        resp = github._get(github.session.base_url)
-        # Response in the form '2023-01-23 10:40:28 UTC'
-        date_string = resp.headers.get(
-            'github-authentication-token-expiration')
+        # PyGithub doesn't expose the token expiration header through a
+        # dedicated API, so request it via the public Requester escape hatch.
+        headers, _ = github.requester.requestJsonAndCheck("GET", "/user")
+        # Response header in the form '2023-01-23 10:40:28 UTC'
+        date_string = headers.get('github-authentication-token-expiration')
         if date_string:
             return date.fromisoformat(date_string.split()[0])
+        return None
 
     def github_commit(self, sha):
         repo = self.as_github_repo()
-        return repo.commit(sha)
+        return repo.get_commit(sha)
 
     def github_release(self, tag):
         repo = self.as_github_repo()
         try:
-            return repo.release_from_tag(tag)
-        except github3.exceptions.NotFoundError:
-            return None
+            return repo.get_release(tag)
+        except GithubException as e:
+            if e.status == 404:
+                return None
+            raise
 
-    def github_upload_asset_requests(self, release, path, name, mime,
-                                     max_retries=None, retry_backoff=None):
+    def github_upload_asset(self, release, path, name, mime,
+                            max_retries=None, retry_backoff=None):
         if max_retries is None:
             max_retries = int(os.environ.get('CROSSBOW_MAX_RETRIES', 8))
         if retry_backoff is None:
@@ -501,59 +499,36 @@ class Repo:
 
         for i in range(max_retries):
             try:
-                with open(path, 'rb') as fp:
-                    result = release.upload_asset(name=name, asset=fp,
-                                                  content_type=mime)
-            except github3.exceptions.ResponseError as e:
-                logger.error('Attempt {} has failed with message: {}.'
-                             .format(i + 1, str(e)))
-                logger.error('Error message {}'.format(e.msg))
-                logger.error('List of errors provided by GitHub:')
-                for err in e.errors:
-                    logger.error(' - {}'.format(err))
+                result = release.upload_asset(path, name=name,
+                                              content_type=mime)
+                logger.info(f"Attempt {i + 1} has finished.")
+                return result
+            except GithubException as e:
+                logger.error(f"Attempt {i + 1} has failed with message: {e}.")
+                if hasattr(e, 'data'):
+                    logger.error(f"Error data: {e.data}")
 
-                if e.code == 422:
+                if e.status == 422:
                     # 422 Validation Failed, probably raised because
                     # ReleaseAsset already exists, so try to remove it before
                     # reattempting the asset upload
-                    for asset in release.assets():
+                    for asset in release.get_assets():
                         if asset.name == name:
-                            logger.info('Release asset {} already exists, '
-                                        'removing it...'.format(name))
-                            asset.delete()
-                            logger.info('Asset {} removed.'.format(name))
+                            logger.info(f"Release asset {name} already exists, "
+                                        "removing it...")
+                            asset.delete_asset()
+                            logger.info(f"Asset {name} removed.")
                             break
-            except github3.exceptions.ConnectionError as e:
-                logger.error('Attempt {} has failed with message: {}.'
-                             .format(i + 1, str(e)))
-            else:
-                logger.info('Attempt {} has finished.'.format(i + 1))
-                return result
+            except IOError as e:
+                # Catch network and file I/O errors (includes requests exceptions)
+                logger.error(f"Attempt {i + 1} has failed with message: {e}.")
 
             time.sleep(retry_backoff)
 
         raise RuntimeError('GitHub asset uploading has failed!')
 
-    def github_upload_asset_curl(self, release, path, name, mime):
-        upload_url, _ = release.upload_url.split('{?')
-        upload_url += '?name={}'.format(name)
-
-        command = [
-            'curl',
-            '--fail',
-            '-H', "Authorization: token {}".format(self.github_token),
-            '-H', "Content-Type: {}".format(mime),
-            '--data-binary', '@{}'.format(path),
-            upload_url
-        ]
-        return subprocess.run(command, shell=False, check=True)
-
     def github_overwrite_release_assets(self, tag_name, target_commitish,
-                                        patterns, method='requests'):
-        # Since github has changed something the asset uploading via requests
-        # got instable, so prefer the cURL alternative.
-        # Potential cause:
-        #    sigmavirus24/github3.py/issues/779#issuecomment-379470626
+                                        patterns):
         repo = self.as_github_repo()
         if not tag_name:
             raise CrossbowError('Empty tag name')
@@ -562,13 +537,14 @@ class Repo:
 
         # remove the whole release if it already exists
         try:
-            release = repo.release_from_tag(tag_name)
-        except github3.exceptions.NotFoundError:
-            pass
-        else:
-            release.delete()
+            release = repo.get_release(tag_name)
+            release.delete_release()
+        except GithubException as e:
+            if e.status != 404:
+                raise
 
-        release = repo.create_release(tag_name, target_commitish)
+        release = repo.create_git_release(tag_name, tag_name, "",
+                                          target_commitish=target_commitish)
         for pattern in patterns:
             for path in glob.glob(pattern, recursive=True):
                 name = os.path.basename(path)
@@ -576,20 +552,11 @@ class Repo:
                 mime = mimetypes.guess_type(name)[0] or 'application/zip'
 
                 logger.info(
-                    'Uploading asset `{}` with mimetype {} and size {}...'
-                    .format(name, mime, size)
+                    f"Uploading asset `{name}` with mimetype {mime} and size "
+                    f"{size}..."
                 )
 
-                if method == 'requests':
-                    self.github_upload_asset_requests(release, path, name=name,
-                                                      mime=mime)
-                elif method == 'curl':
-                    self.github_upload_asset_curl(release, path, name=name,
-                                                  mime=mime)
-                else:
-                    raise CrossbowError(
-                        'Unsupported upload method {}'.format(method)
-                    )
+                self.github_upload_asset(release, path, name=name, mime=mime)
 
     def github_pr(self, title, head=None, base=None, body=None,
                   github_token=None, create=False):
@@ -600,12 +567,11 @@ class Repo:
         repo = self.as_github_repo(github_token=github_token)
         if create:
             return repo.create_pull(title=title, base=base, head=head,
-                                    body=body)
+                                    body=body or "")
         else:
             # Retrieve open PR for base and head.
             # There should be a single open one with that title.
-            for pull in repo.pull_requests(state="open", head=head,
-                                           base=base):
+            for pull in repo.get_pulls(state="open", head=head, base=base):
                 if title in pull.title:
                     return pull
             raise CrossbowError(
@@ -645,12 +611,12 @@ class Queue(Repo):
     def _next_job_id(self, prefix):
         """Auto increments the branch's identifier based on the prefix"""
         latest_id = self._latest_prefix_id(prefix)
-        return '{}-{}'.format(prefix, latest_id + 1)
+        return f"{prefix}-{latest_id + 1}"
 
     def _new_hex_id(self, prefix):
         """Append a new id to branch's identifier based on the prefix"""
         hex_id = uuid.uuid4().hex[:10]
-        return '{}-{}'.format(prefix, hex_id)
+        return f"{prefix}-{hex_id}"
 
     def latest_for_prefix(self, prefix):
         prefix_date = self._prefix_contains_date(prefix)
@@ -667,13 +633,13 @@ class Queue(Repo):
                 raise RuntimeError(
                     f"No job has been submitted with prefix '{prefix}' yet"
                 )
-        job_name = '{}-{}'.format(prefix, latest_id)
+        job_name = f"{prefix}-{latest_id}"
         return self.get(job_name)
 
     def date_of(self, job):
         # it'd be better to bound to the queue repository on deserialization
         # and reorganize these methods to Job
-        branch_name = 'origin/{}'.format(job.branch)
+        branch_name = f'origin/{job.branch}'
         branch = self.repo.branches[branch_name]
         commit = self.repo[branch.target]
         return date.fromtimestamp(commit.commit_time)
@@ -691,13 +657,13 @@ class Queue(Repo):
             yield self.get(name)
 
     def get(self, job_name):
-        branch_name = 'origin/{}'.format(job_name)
+        branch_name = f"origin/{job_name}"
         branch = self.repo.branches[branch_name]
         try:
             content = self.file_contents(branch.target, 'job.yml')
         except KeyError:
             raise CrossbowError(
-                'No job is found with name: {}'.format(job_name)
+                f"No job is found with name: {job_name}"
             )
 
         buffer = StringIO(content.decode('utf-8'))
@@ -724,7 +690,7 @@ class Queue(Repo):
         for task_name, task in job.tasks.items():
             # adding CI's name to the end of the branch in order to use skip
             # patterns on travis and circleci
-            task.branch = '{}-{}-{}'.format(job.branch, task.ci, task_name)
+            task.branch = f"{job.branch}-{task.ci}-{task_name}"
             params = {
                 **job.params,
                 "arrow": job.target,
@@ -740,26 +706,36 @@ class Queue(Repo):
         return self.create_branch(job.branch, files=job.render_files())
 
 
-def get_version(root, **kwargs):
+def get_version(root):
     """
-    Parse function for setuptools_scm that ignores tags for non-C++
-    subprojects, e.g. apache-arrow-js-XXX tags.
+    Calculate a development version from the latest Arrow C++ release tag.
     """
-    from setuptools_scm.git import parse as parse_git_version
-    from setuptools_scm import Configuration
-
-    # query the calculated version based on the git tags
-    kwargs['describe_command'] = (
-        'git describe --dirty --tags --long --match "apache-arrow-[0-9]*.*"'
+    result = subprocess.run(
+        [
+            "git",
+            "describe",
+            "--dirty",
+            "--tags",
+            "--long",
+            "--match",
+            "apache-arrow-[0-9]*.*",
+        ],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
     )
-
-    # Create a Configuration object with necessary parameters
-    config = Configuration(
-        git_describe_command=kwargs['describe_command']
+    description = result.stdout.strip()
+    describe_match = re.fullmatch(
+        r"apache-arrow-(?P<tag>.+)-(?P<distance>\d+)"
+        r"-g[0-9a-f]+(?:-dirty)?",
+        description,
     )
-
-    version = parse_git_version(root, config=config, **kwargs)
-    tag = str(version.tag)
+    if describe_match is None:
+        raise CrossbowError(
+            f"Unable to parse git describe output: {description!r}"
+        )
+    tag = describe_match.group("tag")
 
     # We may get a development tag for the next version, such as "5.0.0.dev0",
     # or the tag of an already released version, such as "4.0.0".
@@ -768,18 +744,21 @@ def get_version(root, **kwargs):
     # 4.0.0 is 5.0.0).
     pattern = r"^(\d+)\.(\d+)\.(\d+)"
     match = re.match(pattern, tag)
+    if match is None:
+        raise CrossbowError(f"Unable to parse Arrow version tag: {tag!r}")
     major, minor, patch = map(int, match.groups())
     if 'dev' not in tag:
         major += 1
 
-    return "{}.{}.{}.dev{}".format(major, minor, patch, version.distance or 0)
+    distance = int(describe_match.group("distance"))
+    return f"{major}.{minor}.{patch}.dev{distance}"
 
 
 class Serializable:
 
     @classmethod
     def to_yaml(cls, representer, data):
-        tag = '!{}'.format(cls.__name__)
+        tag = f"!{cls.__name__}"
         dct = {k: v for k, v in data.__dict__.items() if not k.startswith('_')}
         return representer.represent_mapping(tag, dct)
 
@@ -943,9 +922,8 @@ class Task(Serializable):
                                               params=params)
         except jinja2.TemplateError as e:
             raise RuntimeError(
-                'Failed to render template `{}` with {}: {}'.format(
-                    self.template, e.__class__.__name__, str(e)
-                )
+                f"Failed to render template `{self.template}` with "
+                f"{e.__class__.__name__}: {e}"
             )
 
         tree = {**_default_tree, self.filename: rendered}
@@ -1008,7 +986,7 @@ class TaskStatus:
 
     Parameters
     ----------
-    commit : github3.Commit
+    commit : github.Commit.Commit
         Commit to query the combined status for.
 
     Returns
@@ -1022,8 +1000,8 @@ class TaskStatus:
     """
 
     def __init__(self, commit):
-        status = commit.status()
-        check_runs = list(commit.check_runs())
+        status = commit.get_combined_status()
+        check_runs = list(commit.get_check_runs())
         states = [s.state for s in status.statuses]
 
         for check in check_runs:
@@ -1071,7 +1049,7 @@ class TaskAssets(dict):
         if github_release is None:
             github_assets = {}  # no assets have been uploaded for the task
         else:
-            github_assets = {a.name: a for a in github_release.assets()}
+            github_assets = {a.name: a for a in github_release.get_assets()}
 
         if not validate_patterns:
             # shortcut to avoid pattern validation and just set all artifacts
@@ -1091,9 +1069,10 @@ class TaskAssets(dict):
             elif num_matches == 1:
                 self[pattern] = github_assets[matches[0].group(0)]
             else:
+                matched_names = [m.group(0) for m in matches]
                 raise CrossbowError(
-                    'Only a single asset should match pattern `{}`, there are '
-                    'multiple ones: {}'.format(pattern, ', '.join(matches))
+                    f"Only a single asset should match pattern `{pattern}`, "
+                    f"there are multiple ones: {', '.join(matched_names)}"
                 )
 
     def missing_patterns(self):
@@ -1239,12 +1218,12 @@ class Job(Serializable):
 
             waited_for_minutes = (time.time() - started_at) / 60
             if waited_for_minutes > poll_max_minutes:
-                msg = ('Exceeded the maximum amount of time waiting for job '
-                       'to finish, waited for {} minutes.')
-                raise RuntimeError(msg.format(waited_for_minutes))
+                msg = (f'Exceeded the maximum amount of time waiting for job '
+                       f'to finish, waited for {waited_for_minutes} minutes.')
+                raise RuntimeError(msg)
 
-            logger.info('Waiting {} minutes and then checking again'
-                        .format(poll_interval_minutes))
+            logger.info(f'Waiting {poll_interval_minutes} minutes and then '
+                        'checking again')
             time.sleep(poll_interval_minutes * 60)
 
 
@@ -1278,9 +1257,8 @@ class Config(dict):
         requested_groups = set(group_allowlist)
         invalid_groups = requested_groups - valid_groups
         if invalid_groups:
-            msg = 'Invalid group(s) {!r}. Must be one of {!r}'.format(
-                invalid_groups, valid_groups
-            )
+            msg = (f"Invalid group(s) {invalid_groups!r}. Must be one of "
+                   f"{valid_groups!r}")
             raise CrossbowError(msg)
 
         # treat the task names as glob patterns to select tasks more easily
@@ -1291,7 +1269,7 @@ class Config(dict):
                 requested_tasks.update(matches)
             else:
                 raise CrossbowError(
-                    "Unable to match any tasks for `{}`".format(pattern)
+                    f"Unable to match any tasks for `{pattern}`"
                 )
 
         requested_group_tasks = set()
@@ -1309,7 +1287,7 @@ class Config(dict):
                     requested_group_tasks.update(matches)
                 else:
                     raise CrossbowError(
-                        "Unable to match any tasks for `{}`".format(pattern)
+                        f"Unable to match any tasks for `{pattern}`"
                     )
 
             # remove any tasks that are negated with ~task-name
@@ -1320,7 +1298,7 @@ class Config(dict):
                         matches)
                 else:
                     raise CrossbowError(
-                        "Unable to match any tasks for `{}`".format(pattern)
+                        f"Unable to match any tasks for `{pattern}`"
                     )
 
         requested_tasks = requested_tasks.union(requested_group_tasks)
@@ -1328,9 +1306,7 @@ class Config(dict):
         # validate that the passed and matched tasks are defined in the config
         invalid_tasks = requested_tasks - valid_tasks
         if invalid_tasks:
-            msg = 'Invalid task(s) {!r}. Must be one of {!r}'.format(
-                invalid_tasks, valid_tasks
-            )
+            msg = f'Invalid task(s) {invalid_tasks!r}. Must be one of {valid_tasks!r}'
             raise CrossbowError(msg)
 
         return {
@@ -1346,9 +1322,9 @@ class Config(dict):
                 tasks = self.select(tasks=[pattern])
                 if not tasks:
                     raise CrossbowError(
-                        "The pattern `{}` defined for task group `{}` is not "
-                        "matching any of the tasks defined in the "
-                        "configuration file.".format(pattern, group_name)
+                        f"The pattern `{pattern}` defined for task group "
+                        f"`{group_name}` is not matching any of the tasks "
+                        "defined in the configuration file."
                     )
 
         # validate that the tasks are constructible
@@ -1357,9 +1333,9 @@ class Config(dict):
                 Task(task_name, **task)
             except Exception as e:
                 raise CrossbowError(
-                    'Unable to construct a task object from the '
-                    'definition  of task `{}`. The original error message '
-                    'is: `{}`'.format(task_name, str(e))
+                    "Unable to construct a task object from the "
+                    f"definition of task `{task_name}`. The original error "
+                    f"message is: `{e}`"
                 )
 
         # Get the default branch name from the repository
@@ -1393,8 +1369,8 @@ class Config(dict):
                 )
             )
             if not files:
-                raise CrossbowError('No files have been rendered for task `{}`'
-                                    .format(task_name))
+                raise CrossbowError("No files have been rendered for task "
+                                    f"`{task_name}`")
 
 
 # configure yaml serializer

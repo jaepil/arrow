@@ -15,8 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG base=amd64/ubuntu:22.04
-FROM ${base}
+ARG arch=amd64
+ARG base=ubuntu:22.04
+FROM --platform=linux/${arch} ${base}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -31,8 +32,10 @@ RUN apt-get update -y -q && \
         curl \
         gdb \
         git \
+        libc6-dbg \
         libssl-dev \
         libcurl4-openssl-dev \
+        patch \
         python3-pip \
         python3-venv \
         tzdata \
@@ -68,6 +71,10 @@ RUN latest_system_llvm=14 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists*
 
+ARG cmake
+COPY ci/scripts/install_cmake.sh /arrow/ci/scripts/
+RUN /arrow/ci/scripts/install_cmake.sh ${cmake} /usr/local/
+
 COPY ci/scripts/install_minio.sh /arrow/ci/scripts/
 RUN /arrow/ci/scripts/install_minio.sh latest /usr/local
 
@@ -101,5 +108,4 @@ ENV ARROW_ACERO=ON \
     CMAKE_GENERATOR="Unix Makefiles" \
     PARQUET_BUILD_EXAMPLES=ON \
     PARQUET_BUILD_EXECUTABLES=ON \
-    PATH=/usr/lib/ccache/:$PATH \
     PYTHON=python3

@@ -40,7 +40,7 @@
 #include "arrow/util/debug.h"
 #include "arrow/util/int_util_overflow.h"
 #include "arrow/util/io_util.h"
-#include "arrow/util/logging.h"  // IWYU pragma: keep
+#include "arrow/util/logging_internal.h"  // IWYU pragma: keep
 #include "arrow/util/string.h"
 #include "arrow/util/thread_pool.h"
 #include "arrow/util/ubsan.h"
@@ -54,16 +54,11 @@
 #endif
 
 namespace arrow {
-
-namespace memory_pool {
-
-namespace internal {
+namespace memory_pool::internal {
 
 alignas(kDefaultBufferAlignment) int64_t zero_size_area[1] = {kDebugXorSuffix};
 
-}  // namespace internal
-
-}  // namespace memory_pool
+}  // namespace memory_pool::internal
 
 namespace {
 
@@ -266,6 +261,8 @@ class DebugAllocator {
     }
   }
 
+  static void PrintStats() { WrappedAllocator::PrintStats(); }
+
  private:
   static Result<int64_t> RawSize(int64_t size) {
     if (ARROW_PREDICT_FALSE(internal::AddWithOverflow(size, kOverhead, &size))) {
@@ -380,6 +377,12 @@ class SystemAllocator {
     ARROW_UNUSED(malloc_trim(0));
 #endif
   }
+
+  static void PrintStats() {
+#ifdef __GLIBC__
+    malloc_stats();
+#endif
+  }
 };
 
 #ifdef ARROW_MIMALLOC
@@ -392,15 +395,15 @@ class MimallocAllocator {
       *out = memory_pool::internal::kZeroSizeArea;
       return Status::OK();
     }
-    *out = reinterpret_cast<uint8_t*>(
-        mi_malloc_aligned(static_cast<size_t>(size), static_cast<size_t>(alignment)));
+    *out = reinterpret_cast<uint8_t*>(arrow_mi_malloc_aligned(
+        static_cast<size_t>(size), static_cast<size_t>(alignment)));
     if (*out == NULL) {
       return Status::OutOfMemory("malloc of size ", size, " failed");
     }
     return Status::OK();
   }
 
-  static void ReleaseUnused() { mi_collect(true); }
+  static void ReleaseUnused() { arrow_mi_collect(true); }
 
   static Status ReallocateAligned(int64_t old_size, int64_t new_size, int64_t alignment,
                                   uint8_t** ptr) {
@@ -415,7 +418,7 @@ class MimallocAllocator {
       return Status::OK();
     }
     *ptr = reinterpret_cast<uint8_t*>(
-        mi_realloc_aligned(previous_ptr, static_cast<size_t>(new_size), alignment));
+        arrow_mi_realloc_aligned(previous_ptr, static_cast<size_t>(new_size), alignment));
     if (*ptr == NULL) {
       *ptr = previous_ptr;
       return Status::OutOfMemory("realloc of size ", new_size, " failed");
@@ -427,9 +430,11 @@ class MimallocAllocator {
     if (ptr == memory_pool::internal::kZeroSizeArea) {
       DCHECK_EQ(size, 0);
     } else {
-      mi_free(ptr);
+      arrow_mi_free(ptr);
     }
   }
+
+  static void PrintStats() { mi_stats_print_out(nullptr, nullptr); }
 };
 
 #endif  // defined(ARROW_MIMALLOC)
@@ -511,6 +516,8 @@ class BaseMemoryPoolImpl : public MemoryPool {
   }
 
   void ReleaseUnused() override { Allocator::ReleaseUnused(); }
+
+  void PrintStats() override { Allocator::PrintStats(); }
 
   int64_t bytes_allocated() const override { return stats_.bytes_allocated(); }
 
@@ -724,6 +731,10 @@ void LoggingMemoryPool::Free(uint8_t* buffer, int64_t size, int64_t alignment) {
   std::cout << "Free: size = " << size << ", alignment = " << alignment << std::endl;
 }
 
+void LoggingMemoryPool::ReleaseUnused() { pool_->ReleaseUnused(); }
+
+void LoggingMemoryPool::PrintStats() { pool_->PrintStats(); }
+
 int64_t LoggingMemoryPool::bytes_allocated() const {
   int64_t nb_bytes = pool_->bytes_allocated();
   std::cout << "bytes_allocated: " << nb_bytes << std::endl;
@@ -775,6 +786,14 @@ class ProxyMemoryPool::ProxyMemoryPoolImpl {
     stats_.DidFreeBytes(size);
   }
 
+  void ReleaseUnused() { pool_->ReleaseUnused(); }
+
+  void PrintStats() {
+    // XXX these are the allocation stats for the underlying allocator, not
+    // the subset allocated through the ProxyMemoryPool
+    pool_->PrintStats();
+  }
+
   int64_t bytes_allocated() const { return stats_.bytes_allocated(); }
 
   int64_t max_memory() const { return stats_.max_memory(); }
@@ -809,6 +828,10 @@ void ProxyMemoryPool::Free(uint8_t* buffer, int64_t size, int64_t alignment) {
   return impl_->Free(buffer, size, alignment);
 }
 
+void ProxyMemoryPool::ReleaseUnused() { impl_->ReleaseUnused(); }
+
+void ProxyMemoryPool::PrintStats() { impl_->PrintStats(); }
+
 int64_t ProxyMemoryPool::bytes_allocated() const { return impl_->bytes_allocated(); }
 
 int64_t ProxyMemoryPool::max_memory() const { return impl_->max_memory(); }
@@ -827,6 +850,45 @@ std::vector<std::string> SupportedMemoryBackendNames() {
     supported.push_back(backend.name);
   }
   return supported;
+}
+
+///////////////////////////////////////////////////////////////////////
+// CappedMemoryPool implementation
+
+Status CappedMemoryPool::Allocate(int64_t size, int64_t alignment, uint8_t** out) {
+  // XXX Another thread may allocate memory between the limit check and
+  // the `Allocate` call. It is possible for the two allocations to be successful
+  // while going above the limit.
+  // Solving this issue would require refactoring the `MemoryPool` implementation
+  // to delegate the limit check to `MemoryPoolStats`.
+  const int64_t allocated = wrapped_->bytes_allocated();
+  if (ARROW_PREDICT_FALSE(bytes_allocated_limit_ - allocated < size)) {
+    return OutOfMemory(allocated, size);
+  }
+  return wrapped_->Allocate(size, alignment, out);
+}
+
+Status CappedMemoryPool::Reallocate(int64_t old_size, int64_t new_size, int64_t alignment,
+                                    uint8_t** ptr) {
+  if (new_size > old_size) {
+    const int64_t allocated = wrapped_->bytes_allocated();
+    if (ARROW_PREDICT_FALSE(bytes_allocated_limit_ - allocated < new_size - old_size)) {
+      return OutOfMemory(allocated, new_size - old_size);
+    }
+  }
+  return wrapped_->Reallocate(old_size, new_size, alignment, ptr);
+}
+
+void CappedMemoryPool::Free(uint8_t* buffer, int64_t size, int64_t alignment) {
+  return wrapped_->Free(buffer, size, alignment);
+}
+
+Status CappedMemoryPool::OutOfMemory(int64_t current_allocated, int64_t requested) const {
+  return Status::OutOfMemory(
+      "MemoryPool bytes_allocated cap exceeded: "
+      "limit=",
+      bytes_allocated_limit_, ", current allocation=", current_allocated,
+      ", requested=", requested);
 }
 
 // -----------------------------------------------------------------------

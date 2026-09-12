@@ -19,6 +19,11 @@
 
 {{ macros.github_header() }}
 
+permissions:
+  contents: read
+  # For OIDC token for sccache
+  id-token: write
+
 jobs:
   local:
     name: "install from local source"
@@ -32,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macOS-latest, ubuntu-20.04]
+        os: [macOS-latest, ubuntu-22.04]
 
     steps:
       {{ macros.github_checkout_arrow()|indent }}
@@ -78,6 +83,7 @@ jobs:
           extra-packages: |
             any::rcmdcheck
             any::sys
+      {{ macros.github_configure_aws_credentials()|indent }}
       - name: Install
         env:
           _R_CHECK_CRAN_INCOMING_: false

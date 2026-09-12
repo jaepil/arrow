@@ -71,8 +71,6 @@ test_that("Division", {
   expect_equal(a / 2 / 2, Array$create(c(1:4 / 2 / 2, NA_real_)))
   expect_equal(a %/% 2L %/% 2L, Array$create(c(0L, 0L, 0L, 1L, NA_integer_)))
   expect_equal(a / 0, Array$create(c(Inf, Inf, Inf, Inf, NA_real_)))
-  # TODO add tests for integer division %/% by 0
-  # see https://issues.apache.org/jira/browse/ARROW-14297
 
   b <- a$cast(float64())
   expect_equal(b / 2, Array$create(c(1:4 / 2, NA_real_)))
@@ -81,8 +79,6 @@ test_that("Division", {
   expect_equal(b %/% 2, Array$create(c(0, 1, 1, 2, NA_real_)))
   expect_equal(b %/% 2L, Array$create(c(0, 1, 1, 2, NA_real_)))
   expect_equal(b / 0, Array$create(c(Inf, Inf, Inf, Inf, NA_real_)))
-  # TODO add tests for integer division %/% by 0
-  # see https://issues.apache.org/jira/browse/ARROW-14297
 
   # the behavior of %/% matches R's (i.e. the integer of the quotient, not
   # simply dividing two integers)
@@ -223,22 +219,28 @@ test_that("Math group generics work on Array objects", {
   )
 
   expect_error(signif(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
-  expect_error(expm1(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
 
   expect_error(cospi(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
   expect_error(sinpi(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
   expect_error(tanpi(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
 
-  expect_error(cosh(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
-  expect_error(sinh(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
-  expect_error(tanh(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
-
-  expect_error(acosh(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
-  expect_error(asinh(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
-  expect_error(atanh(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
-
   expect_error(lgamma(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
   expect_error(gamma(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
   expect_error(digamma(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
   expect_error(trigamma(Array$create(c(4L, 1L))), "Unsupported operation on `Array`")
+})
+
+test_that("hyperbolic trig functions work on Array objects", {
+  expect_equal(sinh(Array$create(c(0.6, 0.9))), Array$create(sinh(c(0.6, 0.9))))
+  expect_equal(cosh(Array$create(c(0.6, 0.9))), Array$create(cosh(c(0.6, 0.9))))
+  expect_equal(tanh(Array$create(c(0.6, 0.9))), Array$create(tanh(c(0.6, 0.9))))
+  expect_equal(asinh(Array$create(c(0.6, 0.9))), Array$create(asinh(c(0.6, 0.9))))
+  expect_error(acosh(Array$create(c(0.6, 0.9))), "Invalid: domain error")
+  expect_equal(acosh(Array$create(c(1, 2))), Array$create(acosh(c(1, 2))))
+  expect_error(atanh(Array$create(c(-1, 1))), "Invalid: domain error")
+  expect_equal(atanh(Array$create(c(0.6, 0.9))), Array$create(atanh(c(0.6, 0.9))))
+})
+
+test_that("expm1 works on Array objects", {
+  expect_equal(expm1(Array$create(c(0.00000001, 10))), Array$create(expm1(c(0.00000001, 10))))
 })

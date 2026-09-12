@@ -15,26 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <arrow/compute/function.h>
+#include <arrow/compute/registry.h>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <arrow/dataset/dataset.h>
+#include <arrow/dataset/file_base.h>
+#include <arrow/record_batch.h>
+#include <arrow/util/async_generator.h>
 #include "arrow/acero/exec_plan.h"
+#include "arrow/acero/test_nodes.h"
 #include "arrow/acero/test_util_internal.h"
 #include "arrow/array/array_primitive.h"
+#include "arrow/compute/test_util_internal.h"
 #include "arrow/dataset/api.h"
 #include "arrow/dataset/partition.h"
 #include "arrow/dataset/plan.h"
+#include "arrow/dataset/projector.h"
 #include "arrow/dataset/test_util_internal.h"
 #include "arrow/filesystem/path_util.h"
 #include "arrow/filesystem/test_util.h"
 #include "arrow/status.h"
 #include "arrow/testing/future_util.h"
+#include "arrow/testing/generator.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/util/io_util.h"
 
@@ -42,6 +53,7 @@ namespace cp = arrow::compute;
 
 namespace arrow {
 
+using compute::ExecBatchFromJSON;
 using internal::TemporaryDir;
 
 namespace dataset {
@@ -351,6 +363,261 @@ TEST_F(TestFileSystemDataset, WriteProjected) {
   }
 }
 
+// This kernel delays execution for some specific scalar values,
+// which guarantees the writing phase sees out-of-order exec batches
+Status delay(compute::KernelContext* ctx, const compute::ExecSpan& batch,
+             compute::ExecResult* out) {
+  const ArraySpan& input = batch[0].array;
+  const auto* input_values = input.GetValues<uint32_t>(1);
+  uint8_t* output_values = out->array_span()->buffers[1].data;
+
+  // Boolean data is stored in 1 bit per value
+  for (int64_t i = 0; i < input.length; ++i) {
+    if (input_values[i] % 16 == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    bit_util::SetBitTo(output_values, i, true);
+  }
+
+  return Status::OK();
+}
+
+// A fragment with start=0 will defer ScanBatchesAsync returning a batch generator
+// This guarantees a dataset of multiple fragments could produce out-of-order batches
+class MockFragment : public Fragment {
+ public:
+  explicit MockFragment(uint32_t start, int64_t rows_per_batch, int num_batches,
+                        const std::shared_ptr<Schema>& schema)
+      : Fragment(compute::literal(true), schema),
+        start_(start),
+        rows_per_batch_(rows_per_batch),
+        num_batches_(num_batches) {}
+
+  Result<RecordBatchGenerator> ScanBatchesAsync(
+      const std::shared_ptr<ScanOptions>& options) override {
+    // Fragment with start_=0 defers returning the generator
+    if (start_ == 0) {
+      std::this_thread::sleep_for(std::chrono::duration<double>(0.1));
+    }
+
+    auto vec = gen::Gen({gen::Step(start_)})
+                   ->FailOnError()
+                   ->RecordBatches(rows_per_batch_, num_batches_);
+    auto it = MakeVectorIterator(vec);
+    return MakeBackgroundGenerator(std::move(it), io::default_io_context().executor());
+  }
+
+  std::string type_name() const override { return "mock"; }
+
+ protected:
+  Result<std::shared_ptr<Schema>> ReadPhysicalSchemaImpl() override {
+    return given_physical_schema_;
+  };
+
+ private:
+  uint32_t start_;
+  int64_t rows_per_batch_;
+  int num_batches_;
+};
+
+// This dataset consists of multiple fragments with incrementing values across the
+// fragments
+class MockDataset : public Dataset {
+ public:
+  explicit MockDataset(const std::shared_ptr<Schema>& schema) : Dataset(schema) {}
+
+  MockDataset(const std::shared_ptr<Schema>& schema,
+              const compute::Expression& partition_expression)
+      : Dataset(schema, partition_expression) {}
+
+  std::string type_name() const override { return "mock"; }
+  Result<std::shared_ptr<Dataset>> ReplaceSchema(
+      std::shared_ptr<Schema> schema) const override {
+    RETURN_NOT_OK(CheckProjectable(*schema_, *schema));
+    return std::make_shared<MockDataset>(std::move(schema));
+  }
+
+ protected:
+  Result<FragmentIterator> GetFragmentsImpl(compute::Expression predicate) override {
+    FragmentVector fragments;
+    fragments.push_back(std::make_shared<MockFragment>(0, 2, 1024, schema_));
+    fragments.push_back(std::make_shared<MockFragment>(2 * 1024, 2, 1024, schema_));
+    return MakeVectorIterator(std::move(fragments));
+  };
+};
+
+constexpr random::SeedType kJitterSeed = 42;
+constexpr int kMaxJitterModifier = 4;
+constexpr int64_t kOrderingRowsPerBatch = 1;
+constexpr int kOrderingNumBatches = 256;
+
+Result<bool> HasOutOfOrderRows(const Table& table) {
+  TableBatchReader reader(table);
+  std::shared_ptr<RecordBatch> batch;
+  ARROW_RETURN_NOT_OK(reader.ReadNext(&batch));
+  int32_t prev = 0;
+  bool has_prev = false;
+  while (batch != nullptr) {
+    const auto* values = batch->column(0)->data()->GetValues<int32_t>(1);
+    for (int row = 0; row < batch->num_rows(); ++row) {
+      int32_t value = values[row];
+      if (has_prev && value <= prev) {
+        return true;
+      }
+      prev = value;
+      has_prev = true;
+    }
+    ARROW_RETURN_NOT_OK(reader.ReadNext(&batch));
+  }
+  return false;
+}
+
+TEST_F(TestFileSystemDataset, RejectPreserveOrderWithUnorderedInput) {
+  dataset::internal::Initialize();
+
+  auto format = std::make_shared<IpcFileFormat>();
+  FileSystemDatasetWriteOptions write_options;
+  write_options.file_write_options = format->DefaultWriteOptions();
+  write_options.filesystem = std::make_shared<fs::internal::MockFileSystem>(fs::kNoTime);
+  write_options.base_dir = "root";
+  write_options.partitioning = std::make_shared<HivePartitioning>(schema({}));
+  write_options.basename_template = "{i}.feather";
+  write_options.preserve_order = true;
+
+  auto source_data = acero::MakeBasicBatches();
+  for (const char* factory_name : {"write", "tee"}) {
+    SCOPED_TRACE(factory_name);
+    ASSERT_OK_AND_ASSIGN(auto plan, acero::ExecPlan::Make());
+    AsyncGenerator<std::optional<cp::ExecBatch>> sink_gen;
+    std::vector<acero::Declaration> declarations = {
+        {"source",
+         acero::SourceNodeOptions{source_data.schema, source_data.gen(false, false)}},
+        {factory_name, WriteNodeOptions{write_options}},
+    };
+    if (std::string(factory_name) == "tee") {
+      declarations.emplace_back("sink", acero::SinkNodeOptions{&sink_gen});
+    }
+    ASSERT_OK(
+        acero::Declaration::Sequence(std::move(declarations)).AddToPlan(plan.get()));
+    ASSERT_THAT(plan->Validate(),
+                Raises(StatusCode::Invalid,
+                       ::testing::HasSubstr("no meaningful ordering in the input")));
+  }
+}
+
+TEST_F(TestFileSystemDataset, MultiThreadedWritePersistsOrder) {
+  // Test for GH-26818
+  //
+  // This test uses std::this_thread::sleep_for to increase chances for batches
+  // to get written out-of-order in multi-threaded environment.
+  // With preserve_order = false, the existence of out-of-order is asserted to
+  // verify that the test setup reliably writes out-of-order sequences, and
+  // that write_options.preserve_order = preserve_order can recreate order.
+  //
+  // Estimates for out_of_order == false and preserve_order == false to occur
+  // are 10^-62 https://github.com/apache/arrow/pull/44470#discussion_r2079049038
+  //
+  // If this test starts to reliably fail with preserve_order == false, the test setup
+  // has to be revised to again reliably produce out-of-order sequences.
+
+  auto format = std::make_shared<IpcFileFormat>();
+  FileSystemDatasetWriteOptions write_options;
+  write_options.file_write_options = format->DefaultWriteOptions();
+  write_options.base_dir = "root";
+  write_options.partitioning = std::make_shared<HivePartitioning>(schema({}));
+  write_options.basename_template = "{i}.feather";
+
+  // The Mock dataset delays emitting the first fragment, which test sequenced output of
+  // scan node
+  auto dataset = std::make_shared<MockDataset>(schema({field("f0", int32())}));
+
+  // The delay scalar function delays some batches of all fragments, which tests implicit
+  // ordering
+  auto delay_func = std::make_shared<compute::ScalarFunction>("delay", compute::Arity(1),
+                                                              compute::FunctionDoc());
+  compute::ScalarKernel delay_kernel;
+  delay_kernel.exec = delay;
+  delay_kernel.signature = compute::KernelSignature::Make({int32()}, boolean());
+  ASSERT_OK(delay_func->AddKernel(delay_kernel));
+  ASSERT_OK(compute::GetFunctionRegistry()->AddFunction(delay_func));
+
+  for (bool preserve_order : {true, false}) {
+    ASSERT_OK_AND_ASSIGN(auto scanner_builder, dataset->NewScan());
+    ASSERT_OK(scanner_builder->UseThreads(true));
+    ASSERT_OK(
+        scanner_builder->Filter(compute::call("delay", {compute::field_ref("f0")})));
+    ASSERT_OK_AND_ASSIGN(auto scanner, scanner_builder->Finish());
+
+    auto fs = std::make_shared<fs::internal::MockFileSystem>(fs::kNoTime);
+    write_options.filesystem = fs;
+    write_options.preserve_order = preserve_order;
+
+    ASSERT_OK(FileSystemDataset::Write(write_options, scanner));
+
+    // Read the file back out and verify the order
+    ASSERT_OK_AND_ASSIGN(auto dataset_factory, FileSystemDatasetFactory::Make(
+                                                   fs, {"root/0.feather"}, format, {}));
+    ASSERT_OK_AND_ASSIGN(auto written_dataset, dataset_factory->Finish(FinishOptions{}));
+    ASSERT_OK_AND_ASSIGN(scanner_builder, written_dataset->NewScan());
+    ASSERT_OK(scanner_builder->UseThreads(false));
+    ASSERT_OK_AND_ASSIGN(scanner, scanner_builder->Finish());
+    ASSERT_OK_AND_ASSIGN(auto actual, scanner->ToTable());
+    ASSERT_OK_AND_ASSIGN(auto out_of_order, HasOutOfOrderRows(*actual));
+    ASSERT_EQ(!out_of_order, preserve_order);
+  }
+}
+
+TEST_F(TestFileSystemDataset, MultiThreadedTeeWritePersistsOrder) {
+  dataset::internal::Initialize();
+  acero::RegisterTestNodes();
+
+  auto format = std::make_shared<IpcFileFormat>();
+  auto fs = std::make_shared<fs::internal::MockFileSystem>(fs::kNoTime);
+  FileSystemDatasetWriteOptions write_options;
+  write_options.file_write_options = format->DefaultWriteOptions();
+  write_options.filesystem = fs;
+  write_options.partitioning = std::make_shared<HivePartitioning>(schema({}));
+  write_options.basename_template = "{i}.feather";
+
+  auto unordered_write_options = write_options;
+  unordered_write_options.base_dir = "unordered";
+  unordered_write_options.preserve_order = false;
+  auto ordered_write_options = write_options;
+  ordered_write_options.base_dir = "ordered";
+  ordered_write_options.preserve_order = true;
+
+  auto input = gen::Gen({gen::Step<int32_t>()})
+                   ->FailOnError()
+                   ->Table(kOrderingRowsPerBatch, kOrderingNumBatches);
+
+  // The first TeeNode records the jittered, out-of-order stream without changing it.
+  // The second TeeNode must use the batch indices to restore order.
+  ASSERT_OK(acero::DeclarationToStatus(acero::Declaration::Sequence(
+      {{"table_source", acero::TableSourceNodeOptions{input}},
+       {"jitter", acero::JitterNodeOptions{kJitterSeed, kMaxJitterModifier}},
+       {"tee", WriteNodeOptions{unordered_write_options}, "unordered_tee"},
+       {"tee", WriteNodeOptions{ordered_write_options}, "ordered_tee"}})));
+
+  auto read_written_table =
+      [&](const std::string& path) -> Result<std::shared_ptr<Table>> {
+    ARROW_ASSIGN_OR_RAISE(auto dataset_factory,
+                          FileSystemDatasetFactory::Make(fs, {path}, format, {}));
+    ARROW_ASSIGN_OR_RAISE(auto written_dataset, dataset_factory->Finish(FinishOptions{}));
+    ARROW_ASSIGN_OR_RAISE(auto written_scanner_builder, written_dataset->NewScan());
+    ARROW_RETURN_NOT_OK(written_scanner_builder->UseThreads(false));
+    ARROW_ASSIGN_OR_RAISE(auto written_scanner, written_scanner_builder->Finish());
+    return written_scanner->ToTable();
+  };
+
+  ASSERT_OK_AND_ASSIGN(auto unordered_table, read_written_table("unordered/0.feather"));
+  ASSERT_OK_AND_ASSIGN(auto unordered_out_of_order, HasOutOfOrderRows(*unordered_table));
+  ASSERT_TRUE(unordered_out_of_order);
+
+  ASSERT_OK_AND_ASSIGN(auto ordered_table, read_written_table("ordered/0.feather"));
+  ASSERT_OK_AND_ASSIGN(auto ordered_out_of_order, HasOutOfOrderRows(*ordered_table));
+  ASSERT_FALSE(ordered_out_of_order);
+}
+
 class FileSystemWriteTest : public testing::TestWithParam<std::tuple<bool, bool>> {
   using PlanFactory = std::function<std::vector<acero::Declaration>(
       const FileSystemDatasetWriteOptions&,
@@ -377,9 +644,8 @@ class FileSystemWriteTest : public testing::TestWithParam<std::tuple<bool, bool>
 
     acero::BatchesWithSchema source_data;
     source_data.batches = {
-        acero::ExecBatchFromJSON({int32(), boolean()}, "[[null, true], [4, false]]"),
-        acero::ExecBatchFromJSON({int32(), boolean()},
-                                 "[[5, null], [6, false], [7, false]]")};
+        ExecBatchFromJSON({int32(), boolean()}, "[[null, true], [4, false]]"),
+        ExecBatchFromJSON({int32(), boolean()}, "[[5, null], [6, false], [7, false]]")};
     source_data.schema = schema({field("i32", int32()), field("bool", boolean())});
 
     AsyncGenerator<std::optional<cp::ExecBatch>> sink_gen;
@@ -426,11 +692,12 @@ class FileSystemWriteTest : public testing::TestWithParam<std::tuple<bool, bool>
 };
 
 TEST_P(FileSystemWriteTest, Write) {
-  auto plan_factory = [](const FileSystemDatasetWriteOptions& write_options,
-                         std::function<Future<std::optional<cp::ExecBatch>>()>*
-                             sink_gen) {
-    return std::vector<acero::Declaration>{{"write", WriteNodeOptions{write_options}}};
-  };
+  auto plan_factory =
+      [](const FileSystemDatasetWriteOptions& write_options,
+         std::function<Future<std::optional<cp::ExecBatch>>()>* sink_gen) {
+        return std::vector<acero::Declaration>{
+            {"write", WriteNodeOptions{write_options}}};
+      };
   TestDatasetWriteRoundTrip(plan_factory, /*has_output=*/false);
 }
 

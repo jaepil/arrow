@@ -18,6 +18,7 @@
 #include "arrow/filesystem/azurefs.h"
 #include "arrow/filesystem/azurefs_internal.h"
 
+#include <chrono>
 #include <memory>
 #include <random>
 #include <string>
@@ -40,7 +41,7 @@
 #include "arrow/util/future.h"
 #include "arrow/util/io_util.h"
 #include "arrow/util/key_value_metadata.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/pcg_random.h"
 #include "arrow/util/string.h"
 #include "arrow/util/unreachable.h"
@@ -90,6 +91,26 @@ class BaseAzureEnv : public ::testing::Environment {
     return Status::NotImplemented("BaseAzureEnv::DumpDebugLog");
   }
 };
+
+namespace {
+Result<AzureOptions> MakeOptions(BaseAzureEnv* env) {
+  AzureOptions options;
+  options.account_name = env->account_name();
+  switch (env->backend()) {
+    case AzureBackend::kAzurite:
+      options.blob_storage_authority = "127.0.0.1:10000";
+      options.dfs_storage_authority = "127.0.0.1:10000";
+      options.blob_storage_scheme = "http";
+      options.dfs_storage_scheme = "http";
+      break;
+    case AzureBackend::kAzure:
+      // Use the default values
+      break;
+  }
+  ARROW_EXPECT_OK(options.ConfigureAccountKeyCredential(env->account_key()));
+  return options;
+}
+}  // namespace
 
 template <class AzureEnvClass>
 class AzureEnvImpl : public BaseAzureEnv {
@@ -158,6 +179,24 @@ class AzuriteEnv : public AzureEnvImpl<AzuriteEnv> {
   arrow::internal::PlatformFilename debug_log_path_;
   std::unique_ptr<util::Process> server_process_;
 
+  // Azurite has no readiness endpoint: https://github.com/Azure/Azurite/issues/1666
+  Status WaitForStartup() {
+    ARROW_ASSIGN_OR_RAISE(auto options, MakeOptions(this));
+    ARROW_ASSIGN_OR_RAISE(auto client, options.MakeBlobServiceClient());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::string last_error;
+    while (server_process_->IsRunning() && std::chrono::steady_clock::now() < deadline) {
+      try {
+        client->ListBlobContainers();
+        return Status::OK();
+      } catch (const std::exception& exception) {
+        last_error = exception.what();
+      }
+      SleepFor(0.1);
+    }
+    return Status::IOError("Azurite failed to start: ", last_error);
+  }
+
   using AzureEnvImpl::AzureEnvImpl;
 
  public:
@@ -182,6 +221,7 @@ class AzuriteEnv : public AzureEnvImpl<AzuriteEnv> {
                                     // Azurite with old Node.js on old Ubuntu.
                                     "--skipApiVersionCheck"});
     ARROW_RETURN_NOT_OK(self->server_process_->Execute());
+    ARROW_RETURN_NOT_OK(self->WaitForStartup());
     return self;
   }
 
@@ -264,35 +304,15 @@ class AzureHierarchicalNSEnv : public AzureEnvImpl<AzureHierarchicalNSEnv> {
   bool WithHierarchicalNamespace() const final { return true; }
 };
 
-namespace {
-Result<AzureOptions> MakeOptions(BaseAzureEnv* env) {
-  AzureOptions options;
-  options.account_name = env->account_name();
-  switch (env->backend()) {
-    case AzureBackend::kAzurite:
-      options.blob_storage_authority = "127.0.0.1:10000";
-      options.dfs_storage_authority = "127.0.0.1:10000";
-      options.blob_storage_scheme = "http";
-      options.dfs_storage_scheme = "http";
-      break;
-    case AzureBackend::kAzure:
-      // Use the default values
-      break;
-  }
-  ARROW_EXPECT_OK(options.ConfigureAccountKeyCredential(env->account_key()));
-  return options;
-}
-}  // namespace
-
 struct PreexistingData {
  public:
   using RNG = random::pcg32_fast;
 
  public:
   const std::string container_name;
-  static constexpr char const* kObjectName = "test-object-name";
+  static constexpr const char* kObjectName = "test-object-name";
 
-  static constexpr char const* kLoremIpsum = R"""(
+  static constexpr const char* kLoremIpsum = R"""(
 Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor
 incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis
 nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
@@ -323,7 +343,7 @@ culpa qui officia deserunt mollit anim id est laborum.
   static std::string RandomContainerName(RNG& rng) { return RandomChars(32, rng); }
 
   static std::string RandomChars(int count, RNG& rng) {
-    auto const fillers = std::string("abcdefghijlkmnopqrstuvwxyz0123456789");
+    const auto fillers = std::string("abcdefghijlkmnopqrstuvwxyz0123456789");
     std::uniform_int_distribution<int> d(0, static_cast<int>(fillers.size()) - 1);
     std::string s;
     std::generate_n(std::back_inserter(s), count, [&] { return fillers[d(rng)]; });
@@ -387,6 +407,30 @@ class TestGeneric : public ::testing::Test, public GenericFileSystemTest {
   //     builddir/main/../../threads.c:580:10 #2 0x7fa914b1cd1e in xmlGetGlobalState
   //     builddir/main/../../threads.c:666:31
   bool have_false_positive_memory_leak_with_generator() const override { return true; }
+  // This false positive leak is similar to the one pinpointed in the
+  // have_false_positive_memory_leak_with_generator() comments above,
+  // though the stack trace is different. It happens when a block list
+  // is committed from a background thread.
+  //
+  // clang-format off
+  // Direct leak of 968 byte(s) in 1 object(s) allocated from:
+  //   #0 calloc
+  //   #1 (/lib/x86_64-linux-gnu/libxml2.so.2+0xe25a4)
+  //   #2 __xmlDefaultBufferSize
+  //   #3 xmlBufferCreate
+  //   #4 Azure::Storage::_internal::XmlWriter::XmlWriter()
+  //   #5 Azure::Storage::Blobs::_detail::BlockBlobClient::CommitBlockList
+  //   #6 Azure::Storage::Blobs::BlockBlobClient::CommitBlockList
+  //   #7 arrow::fs::(anonymous namespace)::CommitBlockList
+  //   #8 arrow::fs::(anonymous namespace)::ObjectAppendStream::FlushAsync()::'lambda'
+  // clang-format on
+  //
+  // TODO perhaps remove this skip once we can rely on
+  // https://github.com/Azure/azure-sdk-for-cpp/pull/5767
+  //
+  // Also note that ClickHouse has a workaround for a similar issue:
+  // https://github.com/ClickHouse/ClickHouse/pull/45796
+  bool have_false_positive_memory_leak_with_async_close() const override { return true; }
 
   BaseAzureEnv* env_;
   std::shared_ptr<AzureFileSystem> azure_fs_;
@@ -469,6 +513,11 @@ TEST(AzureFileSystem, InitializeWithDefaultCredential) {
   AzureOptions options;
   options.account_name = "dummy-account-name";
   ARROW_EXPECT_OK(options.ConfigureDefaultCredential());
+  ASSERT_EQ(options.AccountKey(), "");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "");
+  ASSERT_EQ(options.ClientId(), "");
+  ASSERT_EQ(options.ClientSecret(), "");
   EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
 }
 
@@ -485,6 +534,23 @@ TEST(AzureFileSystem, InitializeWithAnonymousCredential) {
   AzureOptions options;
   options.account_name = "dummy-account-name";
   ARROW_EXPECT_OK(options.ConfigureAnonymousCredential());
+  ASSERT_EQ(options.AccountKey(), "");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "");
+  ASSERT_EQ(options.ClientId(), "");
+  ASSERT_EQ(options.ClientSecret(), "");
+  EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
+}
+
+TEST(AzureFileSystem, InitializeWithAccountKeyCredential) {
+  AzureOptions options;
+  options.account_name = "dummy-account-name";
+  ARROW_EXPECT_OK(options.ConfigureAccountKeyCredential("account_key"));
+  ASSERT_EQ(options.AccountKey(), "account_key");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "");
+  ASSERT_EQ(options.ClientId(), "");
+  ASSERT_EQ(options.ClientSecret(), "");
   EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
 }
 
@@ -493,6 +559,11 @@ TEST(AzureFileSystem, InitializeWithClientSecretCredential) {
   options.account_name = "dummy-account-name";
   ARROW_EXPECT_OK(
       options.ConfigureClientSecretCredential("tenant_id", "client_id", "client_secret"));
+  ASSERT_EQ(options.AccountKey(), "");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "tenant_id");
+  ASSERT_EQ(options.ClientId(), "client_id");
+  ASSERT_EQ(options.ClientSecret(), "client_secret");
   EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
 }
 
@@ -500,9 +571,19 @@ TEST(AzureFileSystem, InitializeWithManagedIdentityCredential) {
   AzureOptions options;
   options.account_name = "dummy-account-name";
   ARROW_EXPECT_OK(options.ConfigureManagedIdentityCredential());
+  ASSERT_EQ(options.AccountKey(), "");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "");
+  ASSERT_EQ(options.ClientId(), "");
+  ASSERT_EQ(options.ClientSecret(), "");
   EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
 
   ARROW_EXPECT_OK(options.ConfigureManagedIdentityCredential("specific-client-id"));
+  ASSERT_EQ(options.AccountKey(), "");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "");
+  ASSERT_EQ(options.ClientId(), "specific-client-id");
+  ASSERT_EQ(options.ClientSecret(), "");
   EXPECT_OK_AND_ASSIGN(fs, AzureFileSystem::Make(options));
 }
 
@@ -510,6 +591,11 @@ TEST(AzureFileSystem, InitializeWithCLICredential) {
   AzureOptions options;
   options.account_name = "dummy-account-name";
   ARROW_EXPECT_OK(options.ConfigureCLICredential());
+  ASSERT_EQ(options.AccountKey(), "");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "");
+  ASSERT_EQ(options.ClientId(), "");
+  ASSERT_EQ(options.ClientSecret(), "");
   EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
 }
 
@@ -517,6 +603,11 @@ TEST(AzureFileSystem, InitializeWithWorkloadIdentityCredential) {
   AzureOptions options;
   options.account_name = "dummy-account-name";
   ARROW_EXPECT_OK(options.ConfigureWorkloadIdentityCredential());
+  ASSERT_EQ(options.AccountKey(), "");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "");
+  ASSERT_EQ(options.ClientId(), "");
+  ASSERT_EQ(options.ClientSecret(), "");
   EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
 }
 
@@ -524,12 +615,42 @@ TEST(AzureFileSystem, InitializeWithEnvironmentCredential) {
   AzureOptions options;
   options.account_name = "dummy-account-name";
   ARROW_EXPECT_OK(options.ConfigureEnvironmentCredential());
+  ASSERT_EQ(options.AccountKey(), "");
+  ASSERT_EQ(options.SasToken(), "");
+  ASSERT_EQ(options.TenantId(), "");
+  ASSERT_EQ(options.ClientId(), "");
+  ASSERT_EQ(options.ClientSecret(), "");
   EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
 }
 
 TEST(AzureFileSystem, OptionsCompare) {
-  AzureOptions options;
-  EXPECT_TRUE(options.Equals(options));
+  AzureOptions options0;
+  EXPECT_TRUE(options0.Equals(options0));
+
+  AzureOptions options1;
+  options1.account_name = "account_name";
+  EXPECT_FALSE(options1.Equals(options0));
+
+  AzureOptions options2;
+  options2.account_name = "account_name";
+  ASSERT_OK(options2.ConfigureAccountKeyCredential("fake_account_key"));
+  EXPECT_FALSE(options2.Equals(options1));
+
+  AzureOptions options3;
+  options3.account_name = "account_name";
+  ASSERT_OK(options3.ConfigureAccountKeyCredential("different_fake_account_key"));
+  EXPECT_FALSE(options3.Equals(options2));
+
+  AzureOptions options4;
+  options4.account_name = "account_name";
+  ASSERT_OK(options4.ConfigureSASCredential("fake_sas_token"));
+  EXPECT_FALSE(options4.Equals(options3));
+
+  AzureOptions options5;
+  options5.account_name = "account_name";
+  ASSERT_OK(options5.ConfigureClientSecretCredential("fake_tenant_id", "fake_client_id",
+                                                     "fake_client_secret"));
+  EXPECT_FALSE(options5.Equals(options4));
 }
 
 class TestAzureOptions : public ::testing::Test {
@@ -690,6 +811,36 @@ class TestAzureOptions : public ::testing::Test {
     ASSERT_EQ(options.credential_kind_, AzureOptions::CredentialKind::kEnvironment);
   }
 
+  void TestFromUriCredentialSASToken() {
+    const std::string sas_token =
+        "?se=2024-12-12T18:57:47Z&sig=pAs7qEBdI6sjUhqX1nrhNAKsTY%2B1SqLxPK%"
+        "2BbAxLiopw%3D&sp=racwdxylti&spr=https,http&sr=c&sv=2024-08-04";
+    ASSERT_OK_AND_ASSIGN(
+        auto options,
+        AzureOptions::FromUri(
+            "abfs://file_system@account.dfs.core.windows.net/" + sas_token, nullptr));
+    ASSERT_EQ(options.credential_kind_, AzureOptions::CredentialKind::kSASToken);
+    ASSERT_EQ(options.sas_token_, sas_token);
+  }
+
+  void TestFromUriCredentialSASTokenWithOtherParameters() {
+    const std::string uri_query_string =
+        "?enable_tls=false&se=2024-12-12T18:57:47Z&sig=pAs7qEBdI6sjUhqX1nrhNAKsTY%"
+        "2B1SqLxPK%"
+        "2BbAxLiopw%3D&sp=racwdxylti&spr=https,http&sr=c&sv=2024-08-04";
+    ASSERT_OK_AND_ASSIGN(
+        auto options,
+        AzureOptions::FromUri(
+            "abfs://account@127.0.0.1:10000/container/dir/blob" + uri_query_string,
+            nullptr));
+    ASSERT_EQ(options.credential_kind_, AzureOptions::CredentialKind::kSASToken);
+    ASSERT_EQ(options.sas_token_, uri_query_string);
+    ASSERT_EQ(options.blob_storage_authority, "127.0.0.1:10000");
+    ASSERT_EQ(options.dfs_storage_authority, "127.0.0.1:10000");
+    ASSERT_EQ(options.blob_storage_scheme, "http");
+    ASSERT_EQ(options.dfs_storage_scheme, "http");
+  }
+
   void TestFromUriCredentialInvalid() {
     ASSERT_RAISES(Invalid, AzureOptions::FromUri(
                                "abfs://file_system@account.dfs.core.windows.net/dir/file?"
@@ -776,6 +927,10 @@ TEST_F(TestAzureOptions, FromUriCredentialWorkloadIdentity) {
 }
 TEST_F(TestAzureOptions, FromUriCredentialEnvironment) {
   TestFromUriCredentialEnvironment();
+}
+TEST_F(TestAzureOptions, FromUriCredentialSASToken) { TestFromUriCredentialSASToken(); }
+TEST_F(TestAzureOptions, FromUriCredentialSASTokenWithOtherParameters) {
+  TestFromUriCredentialSASTokenWithOtherParameters();
 }
 TEST_F(TestAzureOptions, FromUriCredentialInvalid) { TestFromUriCredentialInvalid(); }
 TEST_F(TestAzureOptions, FromUriBlobStorageAuthority) {
@@ -912,10 +1067,24 @@ class TestAzureFileSystem : public ::testing::Test {
         .Value;
   }
 
+  Result<std::string> GetContainerSASToken(
+      const std::string& container_name,
+      Azure::Storage::StorageSharedKeyCredential storage_shared_key_credential) {
+    std::string sas_token;
+    Azure::Storage::Sas::BlobSasBuilder builder;
+    std::chrono::seconds available_period(60);
+    builder.ExpiresOn = std::chrono::system_clock::now() + available_period;
+    builder.BlobContainerName = container_name;
+    builder.Resource = Azure::Storage::Sas::BlobSasResource::BlobContainer;
+    builder.SetPermissions(Azure::Storage::Sas::BlobContainerSasPermissions::All);
+    builder.Protocol = Azure::Storage::Sas::SasProtocol::HttpsAndHttp;
+    return builder.GenerateSasToken(storage_shared_key_credential);
+  }
+
   void UploadLines(const std::vector<std::string>& lines, const std::string& path,
                    int total_size) {
     ASSERT_OK_AND_ASSIGN(auto output, fs()->OpenOutputStream(path, {}));
-    for (auto const& line : lines) {
+    for (const auto& line : lines) {
       ASSERT_OK(output->Write(line.data(), line.size()));
     }
     ASSERT_OK(output->Close());
@@ -969,9 +1138,9 @@ class TestAzureFileSystem : public ::testing::Test {
     };
   }
 
-  char const* kSubData = "sub data";
-  char const* kSomeData = "some data";
-  char const* kOtherData = "other data";
+  const char* kSubData = "sub data";
+  const char* kSomeData = "some data";
+  const char* kOtherData = "other data";
 
   void SetUpSmallFileSystemTree() {
     // Set up test containers
@@ -1022,7 +1191,7 @@ class TestAzureFileSystem : public ::testing::Test {
   }
 
 #define ASSERT_RAISES_ERRNO(expr, expected_errno)                                     \
-  for (::arrow::Status _st = ::arrow::internal::GenericToStatus((expr));              \
+  for (::arrow::Status _st = ::arrow::ToStatus((expr));                               \
        !WithErrno(_st, (expected_errno));)                                            \
   FAIL() << "'" ARROW_STRINGIFY(expr) "' did not fail with errno=" << #expected_errno \
          << ": " << _st.ToString()
@@ -1536,29 +1705,7 @@ class TestAzureFileSystem : public ::testing::Test {
 
   void TestOpenOutputStreamCloseAsync() {
 #if defined(ADDRESS_SANITIZER) || defined(ARROW_VALGRIND)
-    // This false positive leak is similar to the one pinpointed in the
-    // have_false_positive_memory_leak_with_generator() comments above,
-    // though the stack trace is different. It happens when a block list
-    // is committed from a background thread.
-    //
-    // clang-format off
-    // Direct leak of 968 byte(s) in 1 object(s) allocated from:
-    //   #0 calloc
-    //   #1 (/lib/x86_64-linux-gnu/libxml2.so.2+0xe25a4)
-    //   #2 __xmlDefaultBufferSize
-    //   #3 xmlBufferCreate
-    //   #4 Azure::Storage::_internal::XmlWriter::XmlWriter()
-    //   #5 Azure::Storage::Blobs::_detail::BlockBlobClient::CommitBlockList
-    //   #6 Azure::Storage::Blobs::BlockBlobClient::CommitBlockList
-    //   #7 arrow::fs::(anonymous namespace)::CommitBlockList
-    //   #8 arrow::fs::(anonymous namespace)::ObjectAppendStream::FlushAsync()::'lambda'
-    // clang-format on
-    //
-    // TODO perhaps remove this skip once we can rely on
-    // https://github.com/Azure/azure-sdk-for-cpp/pull/5767
-    //
-    // Also note that ClickHouse has a workaround for a similar issue:
-    // https://github.com/ClickHouse/ClickHouse/pull/45796
+    // See comment about have_false_positive_memory_leak_with_generator above.
     if (options_.background_writes) {
       GTEST_SKIP() << "False positive memory leak in libxml2 with CloseAsync";
     }
@@ -1615,6 +1762,36 @@ class TestAzureFileSystem : public ::testing::Test {
     stream.reset();
 
     AssertObjectContents(fs.get(), path, payload);
+  }
+
+  void TestSASCredential() {
+    auto data = SetUpPreexistingData();
+
+    ASSERT_OK_AND_ASSIGN(auto env, GetAzureEnv());
+    ASSERT_OK_AND_ASSIGN(auto options, MakeOptions(env));
+    ASSERT_OK_AND_ASSIGN(
+        auto sas_token,
+        GetContainerSASToken(data.container_name,
+                             Azure::Storage::StorageSharedKeyCredential(
+                                 env->account_name(), env->account_key())));
+    // AzureOptions::FromUri will not cut off extra query parameters that it consumes, so
+    // make sure these don't cause problems.
+    auto polluted_sas_token = "?blob_storage_authority=dummy_value0&" +
+                              sas_token.substr(1) + "&credential_kind=dummy-value1";
+    ARROW_EXPECT_OK(options.ConfigureSASCredential(polluted_sas_token));
+    ASSERT_EQ(options.AccountKey(), "");
+    ASSERT_EQ(options.SasToken(), polluted_sas_token);
+    ASSERT_EQ(options.TenantId(), "");
+    ASSERT_EQ(options.ClientId(), "");
+    ASSERT_EQ(options.ClientSecret(), "");
+    EXPECT_OK_AND_ASSIGN(auto fs, AzureFileSystem::Make(options));
+
+    AssertFileInfo(fs.get(), data.ObjectPath(), FileType::File);
+
+    // Test CopyFile because the most obvious implementation requires generating a SAS
+    // token at runtime which doesn't work when the original auth is SAS token.
+    ASSERT_OK(fs->CopyFile(data.ObjectPath(), data.ObjectPath() + "_copy"));
+    AssertFileInfo(fs.get(), data.ObjectPath() + "_copy", FileType::File);
   }
 
  private:
@@ -1797,7 +1974,7 @@ class TestAzureFileSystem : public ::testing::Test {
     FileInfo _src_info;                                                                 \
     ASSERT_OK(                                                                          \
         CheckExpectedErrno(_src, _dest, _expected_errno, #expected_errno, &_src_info)); \
-    auto _move_st = ::arrow::internal::GenericToStatus(fs()->Move(_src, _dest));        \
+    auto _move_st = ::arrow::ToStatus(fs()->Move(_src, _dest));                         \
     if (_expected_errno.has_value()) {                                                  \
       if (WithErrno(_move_st, *_expected_errno)) {                                      \
         /* If the Move failed, the source should remain unchanged. */                   \
@@ -2328,6 +2505,10 @@ TYPED_TEST(TestAzureFileSystemOnAllScenarios, CreateContainerFromPath) {
 
 TYPED_TEST(TestAzureFileSystemOnAllScenarios, MovePath) { this->TestMovePath(); }
 
+TYPED_TEST(TestAzureFileSystemOnAllScenarios, SASCredential) {
+  this->TestSASCredential();
+}
+
 // Tests using Azurite (the local Azure emulator)
 
 TEST_F(TestAzuriteFileSystem, CheckIfHierarchicalNamespaceIsEnabledRuntimeError) {
@@ -2634,6 +2815,17 @@ TEST_F(TestAzuriteFileSystem, CopyFileSuccessDestinationNonexistent) {
   EXPECT_EQ(PreexistingData::kLoremIpsum, buffer->ToString());
 }
 
+TEST_F(TestAzuriteFileSystem, CopyFileSuccessDestinationDifferentContainer) {
+  auto data = SetUpPreexistingData();
+  auto data2 = SetUpPreexistingData();
+  const auto destination_path = data2.ContainerPath("copy-destionation");
+  ASSERT_OK(fs()->CopyFile(data.ObjectPath(), destination_path));
+  ASSERT_OK_AND_ASSIGN(auto info, fs()->GetFileInfo(destination_path));
+  ASSERT_OK_AND_ASSIGN(auto stream, fs()->OpenInputStream(info));
+  ASSERT_OK_AND_ASSIGN(auto buffer, stream->Read(1024));
+  EXPECT_EQ(PreexistingData::kLoremIpsum, buffer->ToString());
+}
+
 TEST_F(TestAzuriteFileSystem, CopyFileSuccessDestinationSame) {
   auto data = SetUpPreexistingData();
   ASSERT_OK(fs()->CopyFile(data.ObjectPath(), data.ObjectPath()));
@@ -2766,8 +2958,7 @@ std::shared_ptr<const KeyValueMetadata> NormalizerKeyValueMetadata(
         value = "2023-10-31T08:15:20Z";
       }
     } else if (key == "ETag") {
-      if (arrow::internal::StartsWith(value, "\"") &&
-          arrow::internal::EndsWith(value, "\"")) {
+      if (value.starts_with("\"") && value.ends_with("\"")) {
         // Valid value
         value = "\"ETagValue\"";
       }
@@ -3036,8 +3227,8 @@ TEST_F(TestAzuriteFileSystem, OpenInputFileMixedReadVsReadAt) {
     }
 
     // Verify random reads interleave too.
-    auto const index = PreexistingData::RandomIndex(kLineCount, rng_);
-    auto const position = index * kLineWidth;
+    const auto index = PreexistingData::RandomIndex(kLineCount, rng_);
+    const auto position = index * kLineWidth;
     ASSERT_OK_AND_ASSIGN(size, file->ReadAt(position, buffer.size(), buffer.data()));
     EXPECT_EQ(size, kLineWidth);
     auto actual = std::string{buffer.begin(), buffer.end()};
@@ -3070,8 +3261,8 @@ TEST_F(TestAzuriteFileSystem, OpenInputFileRandomSeek) {
   for (int i = 0; i != 32; ++i) {
     SCOPED_TRACE("Iteration " + std::to_string(i));
     // Verify sequential reads work as expected.
-    auto const index = PreexistingData::RandomIndex(kLineCount, rng_);
-    auto const position = index * kLineWidth;
+    const auto index = PreexistingData::RandomIndex(kLineCount, rng_);
+    const auto position = index * kLineWidth;
     ASSERT_OK(file->Seek(position));
     ASSERT_OK_AND_ASSIGN(auto actual, file->Read(kLineWidth));
     EXPECT_EQ(lines[index], actual->ToString());
@@ -3107,7 +3298,7 @@ TEST_F(TestAzuriteFileSystem, OpenInputFileInfo) {
   auto constexpr kStart = 16;
   ASSERT_OK_AND_ASSIGN(size, file->ReadAt(kStart, buffer.size(), buffer.data()));
 
-  auto const expected = std::string(PreexistingData::kLoremIpsum).substr(kStart);
+  const auto expected = std::string(PreexistingData::kLoremIpsum).substr(kStart);
   EXPECT_EQ(std::string(buffer.data(), size), expected);
 }
 

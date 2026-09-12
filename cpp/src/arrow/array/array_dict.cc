@@ -40,7 +40,7 @@
 #include "arrow/util/bitmap_ops.h"
 #include "arrow/util/checked_cast.h"
 #include "arrow/util/int_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/visit_type_inline.h"
 
 namespace arrow {
@@ -108,10 +108,8 @@ DictionaryArray::DictionaryArray(const std::shared_ptr<DataType>& type,
 }
 
 const std::shared_ptr<Array>& DictionaryArray::dictionary() const {
-  if (!dictionary_) {
-    // TODO(GH-36503) this isn't thread safe
-    dictionary_ = MakeArray(data_->dictionary);
-  }
+  std::call_once(dictionary_init_flag_,
+                 [this]() { dictionary_ = MakeArray(data_->dictionary); });
   return dictionary_;
 }
 

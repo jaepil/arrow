@@ -27,7 +27,7 @@
 #include "arrow/status.h"
 #include "arrow/type.h"
 #include "arrow/util/int_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
@@ -349,6 +349,7 @@ Status AdaptiveUIntBuilder::AppendValuesInternal(const uint64_t* values, int64_t
 
 Status AdaptiveUIntBuilder::AppendValues(const uint64_t* values, int64_t length,
                                          const uint8_t* valid_bytes) {
+  RETURN_NOT_OK(CommitPendingData());
   RETURN_NOT_OK(Reserve(length));
 
   return AppendValuesInternal(values, length, valid_bytes);

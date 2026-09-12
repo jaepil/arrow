@@ -134,6 +134,51 @@ TEST(TestSparseUnionArray, GetFlattenedField) {
   }
 }
 
+TEST(TestSparseUnionArray, SliceIsNull) {
+  // GH-50105: Sliced sparse union element access can return incorrect values.
+  auto type_ids = ArrayFromJSON(int8(), "[0, 1, 0, 1, 0]");
+  auto ints = ArrayFromJSON(int64(), "[null, 20, 30, 40, 50]");
+  auto strs = ArrayFromJSON(utf8(), R"(["a", "b", "c", null, "e"])");
+
+  // arr == [null, "b", 30, null, 50].
+  ASSERT_OK_AND_ASSIGN(const auto arr, SparseUnionArray::Make(*type_ids, {ints, strs}));
+
+  // Check that IsNull() returns the expected logical nullness for sliced entries.
+  auto check_slice = [](const std::shared_ptr<SparseUnionArray>& sliced,
+                        const std::initializer_list<bool> expected_is_null) {
+    ASSERT_EQ(sliced->length(), static_cast<int64_t>(expected_is_null.size()));
+
+    ArraySpan span(*sliced->data());
+    int64_t i = 0;
+    for (bool expected : expected_is_null) {
+      ASSERT_EQ(expected, sliced->IsNull(i));
+      ASSERT_EQ(expected, span.IsNull(i));
+      ++i;
+    }
+  };
+
+  // slice(1, 4) == ["b", 30, null, 50].
+  auto sliced_1_4 = checked_pointer_cast<SparseUnionArray>(arr->Slice(1, 4));
+  check_slice(sliced_1_4, {false, false, true, false});
+
+  // Check that the parent and child offsets compose correctly.
+  auto ints_with_offset =
+      ArrayFromJSON(int64(), "[999, null, 20, 30, 40, 50]")->Slice(1, 5);
+  auto strs_with_offset =
+      ArrayFromJSON(utf8(), R"(["z", "a", "b", "c", null, "e"])")->Slice(1, 5);
+
+  // arr_with_sliced_children == [null, "b", 30, null, 50].
+  ASSERT_OK_AND_ASSIGN(
+      const auto arr_with_sliced_children,
+      SparseUnionArray::Make(*type_ids, {ints_with_offset, strs_with_offset}));
+
+  // arr_with_sliced_children.slice(1, 4) == ["b", 30, null, 50].
+  auto sliced_children_1_4 =
+      checked_pointer_cast<SparseUnionArray>(arr_with_sliced_children->Slice(1, 4));
+
+  check_slice(sliced_children_1_4, {false, false, true, false});
+}
+
 TEST(TestSparseUnionArray, Validate) {
   auto a = ArrayFromJSON(int32(), "[4, 5]");
   auto type = sparse_union({field("a", int32())});
@@ -164,6 +209,36 @@ TEST(TestSparseUnionArray, Validate) {
   arr = std::make_shared<SparseUnionArray>(type, 0, children, type_ids,
                                            /*offset=*/3);
   ASSERT_RAISES(Invalid, arr->ValidateFull());
+}
+
+TEST(TestSparseUnionArray, Comparison) {
+  auto ints1 = ArrayFromJSON(int32(), "[1, 2, 3, 4, 5, 6]");
+  auto ints2 = ArrayFromJSON(int32(), "[1, 2, -3, 4, -5, 6]");
+  auto strs1 = ArrayFromJSON(utf8(), R"(["a", "b", "c", "d", "e", "f"])");
+  auto strs2 = ArrayFromJSON(utf8(), R"(["a", "*", "c", "d", "e", "*"])");
+  std::vector<int8_t> type_codes{8, 42};
+
+  auto check_equality = [&](const std::string& type_ids_json1,
+                            const std::string& type_ids_json2, bool expected_equals) {
+    auto type_ids1 = ArrayFromJSON(int8(), type_ids_json1);
+    auto type_ids2 = ArrayFromJSON(int8(), type_ids_json2);
+    ASSERT_OK_AND_ASSIGN(auto arr1,
+                         SparseUnionArray::Make(*type_ids1, {ints1, strs1}, type_codes));
+    ASSERT_OK_AND_ASSIGN(auto arr2,
+                         SparseUnionArray::Make(*type_ids2, {ints2, strs2}, type_codes));
+    ASSERT_EQ(arr1->Equals(arr2), expected_equals);
+    ASSERT_EQ(arr2->Equals(arr1), expected_equals);
+  };
+
+  // Same type ids
+  check_equality("[8, 8, 42, 42, 42, 8]", "[8, 8, 42, 42, 42, 8]", true);
+  check_equality("[8, 8, 42, 42, 42, 42]", "[8, 8, 42, 42, 42, 42]", false);
+  check_equality("[8, 8, 8, 42, 42, 8]", "[8, 8, 8, 42, 42, 8]", false);
+  check_equality("[8, 42, 42, 42, 42, 8]", "[8, 42, 42, 42, 42, 8]", false);
+
+  // Different type ids
+  check_equality("[42, 8, 42, 42, 42, 8]", "[8, 8, 42, 42, 42, 8]", false);
+  check_equality("[8, 8, 42, 42, 42, 8]", "[8, 8, 42, 42, 42, 42]", false);
 }
 
 // -------------------------------------------------------------------------

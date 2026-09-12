@@ -25,7 +25,7 @@
 #include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/util/bit_util.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/slice_util_internal.h"
 #include "arrow/util/string.h"
 
@@ -41,8 +41,7 @@ Result<std::shared_ptr<Buffer>> Buffer::CopySlice(const int64_t start,
 
   ARROW_ASSIGN_OR_RAISE(auto new_buffer, AllocateResizableBuffer(nbytes, pool));
   std::memcpy(new_buffer->mutable_data(), data() + start, static_cast<size_t>(nbytes));
-  // R build with openSUSE155 requires an explicit shared_ptr construction
-  return std::shared_ptr<Buffer>(std::move(new_buffer));
+  return new_buffer;
 }
 
 Buffer::Buffer() : Buffer(memory_pool::internal::kZeroSizeArea, 0) {}
@@ -63,31 +62,31 @@ Status CheckBufferSlice(const Buffer& buffer, int64_t offset) {
 
 }  // namespace
 
-Result<std::shared_ptr<Buffer>> SliceBufferSafe(const std::shared_ptr<Buffer>& buffer,
+Result<std::shared_ptr<Buffer>> SliceBufferSafe(std::shared_ptr<Buffer> buffer,
                                                 int64_t offset) {
   RETURN_NOT_OK(CheckBufferSlice(*buffer, offset));
-  return SliceBuffer(buffer, offset);
+  return SliceBuffer(std::move(buffer), offset);
 }
 
-Result<std::shared_ptr<Buffer>> SliceBufferSafe(const std::shared_ptr<Buffer>& buffer,
+Result<std::shared_ptr<Buffer>> SliceBufferSafe(std::shared_ptr<Buffer> buffer,
                                                 int64_t offset, int64_t length) {
   RETURN_NOT_OK(CheckBufferSlice(*buffer, offset, length));
-  return SliceBuffer(buffer, offset, length);
+  return SliceBuffer(std::move(buffer), offset, length);
 }
 
-Result<std::shared_ptr<Buffer>> SliceMutableBufferSafe(
-    const std::shared_ptr<Buffer>& buffer, int64_t offset) {
+Result<std::shared_ptr<Buffer>> SliceMutableBufferSafe(std::shared_ptr<Buffer> buffer,
+                                                       int64_t offset) {
   RETURN_NOT_OK(CheckBufferSlice(*buffer, offset));
-  return SliceMutableBuffer(buffer, offset);
+  return SliceMutableBuffer(std::move(buffer), offset);
 }
 
-Result<std::shared_ptr<Buffer>> SliceMutableBufferSafe(
-    const std::shared_ptr<Buffer>& buffer, int64_t offset, int64_t length) {
+Result<std::shared_ptr<Buffer>> SliceMutableBufferSafe(std::shared_ptr<Buffer> buffer,
+                                                       int64_t offset, int64_t length) {
   RETURN_NOT_OK(CheckBufferSlice(*buffer, offset, length));
-  return SliceMutableBuffer(buffer, offset, length);
+  return SliceMutableBuffer(std::move(buffer), offset, length);
 }
 
-std::string Buffer::ToHexString() {
+std::string Buffer::ToHexString() const {
   return HexEncode(data(), static_cast<size_t>(size()));
 }
 
@@ -149,27 +148,18 @@ Result<std::shared_ptr<Buffer>> Buffer::ViewOrCopy(
   return MemoryManager::CopyBuffer(source, to);
 }
 
-class StlStringBuffer : public Buffer {
- public:
-  explicit StlStringBuffer(std::string data) : input_(std::move(data)) {
-    if (!input_.empty()) {
-      data_ = reinterpret_cast<const uint8_t*>(input_.c_str());
-      size_ = static_cast<int64_t>(input_.size());
-      capacity_ = size_;
-    }
+std::shared_ptr<Buffer> Buffer::FromString(std::string data) {
+  if (data.empty()) {
+    return std::shared_ptr<Buffer>{new Buffer()};
   }
 
- private:
-  std::string input_;
-};
-
-std::shared_ptr<Buffer> Buffer::FromString(std::string data) {
-  return std::make_shared<StlStringBuffer>(std::move(data));
+  auto size_in_bytes = static_cast<int64_t>(data.size());
+  return TakeOwnership(std::move(data), size_in_bytes);
 }
 
-std::shared_ptr<Buffer> SliceMutableBuffer(const std::shared_ptr<Buffer>& buffer,
+std::shared_ptr<Buffer> SliceMutableBuffer(std::shared_ptr<Buffer> buffer,
                                            const int64_t offset, const int64_t length) {
-  return std::make_shared<MutableBuffer>(buffer, offset, length);
+  return std::make_shared<MutableBuffer>(std::move(buffer), offset, length);
 }
 
 MutableBuffer::MutableBuffer(const std::shared_ptr<Buffer>& parent, const int64_t offset,
@@ -186,8 +176,7 @@ Result<std::shared_ptr<Buffer>> AllocateBitmap(int64_t length, MemoryPool* pool)
   if (buf->size() > 0) {
     buf->mutable_data()[buf->size() - 1] = 0;
   }
-  // R build with openSUSE155 requires an explicit shared_ptr construction
-  return std::shared_ptr<Buffer>(std::move(buf));
+  return buf;
 }
 
 Result<std::shared_ptr<Buffer>> AllocateEmptyBitmap(int64_t length, MemoryPool* pool) {
@@ -199,12 +188,7 @@ Result<std::shared_ptr<Buffer>> AllocateEmptyBitmap(int64_t length, int64_t alig
   ARROW_ASSIGN_OR_RAISE(auto buf,
                         AllocateBuffer(bit_util::BytesForBits(length), alignment, pool));
   memset(buf->mutable_data(), 0, static_cast<size_t>(buf->size()));
-  // R build with openSUSE155 requires an explicit shared_ptr construction
-  return std::shared_ptr<Buffer>(std::move(buf));
-}
-
-Status AllocateEmptyBitmap(int64_t length, std::shared_ptr<Buffer>* out) {
-  return AllocateEmptyBitmap(length).Value(out);
+  return buf;
 }
 
 Result<std::shared_ptr<Buffer>> ConcatenateBuffers(
@@ -222,8 +206,7 @@ Result<std::shared_ptr<Buffer>> ConcatenateBuffers(
       out_data += buffer->size();
     }
   }
-  // R build with openSUSE155 requires an explicit shared_ptr construction
-  return std::shared_ptr<Buffer>(std::move(out));
+  return out;
 }
 
 }  // namespace arrow

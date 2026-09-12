@@ -105,7 +105,13 @@ ARROW_TESTING_EXPORT
 Status MakeNullRecordBatch(std::shared_ptr<RecordBatch>* out);
 
 ARROW_TESTING_EXPORT
+Status MakeListRecordBatchSized(int length, std::shared_ptr<RecordBatch>* out);
+
+ARROW_TESTING_EXPORT
 Status MakeListRecordBatch(std::shared_ptr<RecordBatch>* out);
+
+ARROW_TESTING_EXPORT
+Status MakeListViewRecordBatchSized(int length, std::shared_ptr<RecordBatch>* out);
 
 ARROW_TESTING_EXPORT
 Status MakeListViewRecordBatch(std::shared_ptr<RecordBatch>* out);
@@ -178,6 +184,12 @@ Status MakeComplex128(std::shared_ptr<RecordBatch>* out);
 
 ARROW_TESTING_EXPORT
 Status MakeDictExtension(std::shared_ptr<RecordBatch>* out);
+
+ARROW_TESTING_EXPORT
+Status MakeDenseUnionExtension(std::shared_ptr<RecordBatch>* out);
+
+ARROW_TESTING_EXPORT
+Status MakeSparseUnionExtension(std::shared_ptr<RecordBatch>* out);
 
 ARROW_TESTING_EXPORT
 Status MakeRandomTensor(const std::shared_ptr<DataType>& type,

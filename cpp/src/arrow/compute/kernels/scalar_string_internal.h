@@ -21,6 +21,7 @@
 
 #include "arrow/compute/api_scalar.h"
 #include "arrow/compute/kernels/common_internal.h"
+#include "arrow/type_traits.h"
 
 namespace arrow {
 namespace compute {
@@ -68,10 +69,13 @@ static int64_t GetVarBinaryValuesLength(const ArraySpan& span) {
 ///
 /// and returns the number of codeunits of the `output` sequence or a negative
 /// value if an invalid input sequence is detected.
-template <typename Type, typename StringTransform>
+template <typename PhysicalType, typename StringTransform>
 struct StringTransformExecBase {
-  using offset_type = typename Type::offset_type;
-  using ArrayType = typename TypeTraits<Type>::ArrayType;
+  using offset_type = typename PhysicalType::offset_type;
+  using ArrayType = typename TypeTraits<PhysicalType>::ArrayType;
+
+  static_assert(!is_string_or_string_view(PhysicalType::type_id),
+                "should only codegen on physical types");
 
   static Status Execute(KernelContext* ctx, StringTransform* transform,
                         const ExecSpan& batch, ExecResult* out) {
@@ -106,7 +110,7 @@ struct StringTransformExecBase {
       }
       output_string_offsets[i + 1] = output_ncodeunits;
     }
-    DCHECK_LE(output_ncodeunits, max_output_ncodeunits);
+    ARROW_DCHECK_LE(output_ncodeunits, max_output_ncodeunits);
 
     // Trim the codepoint buffer, since we may have allocated too much
     return values_buffer->Resize(output_ncodeunits, /*shrink_to_fit=*/true);
@@ -121,9 +125,11 @@ struct StringTransformExecBase {
   }
 };
 
-template <typename Type, typename StringTransform>
-struct StringTransformExec : public StringTransformExecBase<Type, StringTransform> {
-  using StringTransformExecBase<Type, StringTransform>::Execute;
+template <typename Type, typename StringTransform,
+          typename PhysicalType = typename Type::PhysicalType>
+struct StringTransformExec
+    : public StringTransformExecBase<PhysicalType, StringTransform> {
+  using StringTransformExecBase<PhysicalType, StringTransform>::Execute;
 
   static Status Exec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) {
     StringTransform transform;
@@ -132,11 +138,12 @@ struct StringTransformExec : public StringTransformExecBase<Type, StringTransfor
   }
 };
 
-template <typename Type, typename StringTransform>
+template <typename Type, typename StringTransform,
+          typename PhysicalType = typename Type::PhysicalType>
 struct StringTransformExecWithState
-    : public StringTransformExecBase<Type, StringTransform> {
+    : public StringTransformExecBase<PhysicalType, StringTransform> {
   using State = typename StringTransform::State;
-  using StringTransformExecBase<Type, StringTransform>::Execute;
+  using StringTransformExecBase<PhysicalType, StringTransform>::Execute;
 
   static Status Exec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) {
     StringTransform transform(State::Get(ctx));
@@ -151,12 +158,12 @@ void MakeUnaryStringBatchKernel(
     MemAllocation::type mem_allocation = MemAllocation::PREALLOCATE) {
   auto func = std::make_shared<ScalarFunction>(name, Arity::Unary(), std::move(doc));
   for (const auto& ty : StringTypes()) {
-    auto exec = GenerateVarBinaryToVarBinary<ExecFunctor>(ty);
+    auto exec = GenerateTypeAgnosticVarBinaryBase<ExecFunctor>(ty);
     ScalarKernel kernel{{ty}, ty, std::move(exec)};
     kernel.mem_allocation = mem_allocation;
-    DCHECK_OK(func->AddKernel(std::move(kernel)));
+    ARROW_DCHECK_OK(func->AddKernel(std::move(kernel)));
   }
-  DCHECK_OK(registry->AddFunction(std::move(func)));
+  ARROW_DCHECK_OK(registry->AddFunction(std::move(func)));
 }
 
 template <template <typename> class ExecFunctor>
@@ -168,15 +175,15 @@ void MakeUnaryStringBatchKernelWithState(
     using t32 = ExecFunctor<StringType>;
     ScalarKernel kernel{{utf8()}, utf8(), t32::Exec, t32::State::Init};
     kernel.mem_allocation = mem_allocation;
-    DCHECK_OK(func->AddKernel(std::move(kernel)));
+    ARROW_DCHECK_OK(func->AddKernel(std::move(kernel)));
   }
   {
     using t64 = ExecFunctor<LargeStringType>;
     ScalarKernel kernel{{large_utf8()}, large_utf8(), t64::Exec, t64::State::Init};
     kernel.mem_allocation = mem_allocation;
-    DCHECK_OK(func->AddKernel(std::move(kernel)));
+    ARROW_DCHECK_OK(func->AddKernel(std::move(kernel)));
   }
-  DCHECK_OK(registry->AddFunction(std::move(func)));
+  ARROW_DCHECK_OK(registry->AddFunction(std::move(func)));
 }
 
 // ----------------------------------------------------------------------
@@ -216,6 +223,9 @@ static inline FunctionDoc StringClassifyDoc(std::string class_summary,
 
 template <typename Type, typename Predicate>
 struct StringPredicateFunctor {
+  static_assert(!is_string_or_string_view(Type::type_id),
+                "should only codegen on physical types");
+
   static Status Exec(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) {
     Status st = Status::OK();
     EnsureUtf8LookupTablesFilled();
@@ -237,10 +247,10 @@ void AddUnaryStringPredicate(std::string name, FunctionRegistry* registry,
                              FunctionDoc doc) {
   auto func = std::make_shared<ScalarFunction>(name, Arity::Unary(), std::move(doc));
   for (const auto& ty : StringTypes()) {
-    auto exec = GenerateVarBinaryToVarBinary<StringPredicateFunctor, Predicate>(ty);
-    DCHECK_OK(func->AddKernel({ty}, boolean(), std::move(exec)));
+    auto exec = GenerateTypeAgnosticVarBinaryBase<StringPredicateFunctor, Predicate>(ty);
+    ARROW_DCHECK_OK(func->AddKernel({ty}, boolean(), std::move(exec)));
   }
-  DCHECK_OK(registry->AddFunction(std::move(func)));
+  ARROW_DCHECK_OK(registry->AddFunction(std::move(func)));
 }
 
 // ----------------------------------------------------------------------
@@ -281,7 +291,7 @@ struct ReplaceStringSliceTransformBase : public StringTransformBase {
 template <typename Options>
 struct StringSplitFinderBase {
   virtual ~StringSplitFinderBase() = default;
-  virtual Status PreExec(const Options& options) { return Status::OK(); }
+  virtual Status PreExec(const Options& options, bool is_utf8) { return Status::OK(); }
 
   // Derived classes should also define these methods:
   //   static bool Find(const uint8_t* begin, const uint8_t* end,
@@ -319,8 +329,9 @@ struct StringSplitExec {
   }
 
   Status Execute(KernelContext* ctx, const ExecSpan& batch, ExecResult* out) {
+    const bool is_utf8 = is_string_or_string_view(batch[0].type()->id());
     SplitFinder finder;
-    RETURN_NOT_OK(finder.PreExec(options));
+    RETURN_NOT_OK(finder.PreExec(options, is_utf8));
     // TODO(wesm): refactor to not require creating ArrayData
     const ArrayType input(batch[0].array.ToArrayData());
 
@@ -333,7 +344,7 @@ struct StringSplitExec {
     ArrayData* output_list = out->array_data().get();
     // List offsets were preallocated
     auto* list_offsets = output_list->GetMutableValues<list_offset_type>(1);
-    DCHECK_NE(list_offsets, nullptr);
+    ARROW_DCHECK_NE(list_offsets, nullptr);
     // Initial value
     *list_offsets++ = 0;
     for (int64_t i = 0; i < input.length(); ++i) {
@@ -347,9 +358,11 @@ struct StringSplitExec {
       *list_offsets++ = static_cast<list_offset_type>(builder.length());
     }
     // Assign string array to list child data
-    std::shared_ptr<Array> string_array;
-    RETURN_NOT_OK(builder.Finish(&string_array));
-    output_list->child_data.push_back(string_array->data());
+    ARROW_ASSIGN_OR_RAISE(auto physical_array, builder.Finish());
+    // We got the physical type (e.g. binary instead of utf8), need to patch it
+    auto child_data = physical_array->data()->Copy();
+    child_data->type = batch[0].type()->GetSharedPtr();
+    output_list->child_data.push_back(std::move(child_data));
     return Status::OK();
   }
 

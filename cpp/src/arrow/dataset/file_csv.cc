@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -40,7 +41,7 @@
 #include "arrow/util/async_generator.h"
 #include "arrow/util/bit_util.h"
 #include "arrow/util/iterator.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/tracing_internal.h"
 #include "arrow/util/utf8.h"
 
@@ -52,6 +53,10 @@ using internal::Executor;
 using internal::SerialExecutor;
 
 namespace dataset {
+
+namespace {
+
+using RecordBatchGenerator = std::function<Future<std::shared_ptr<RecordBatch>>()>;
 
 struct CsvInspectedFragment : public InspectedFragment {
   CsvInspectedFragment(std::vector<std::string> column_names,
@@ -142,8 +147,6 @@ class CsvFileScanner : public FragmentScanner {
   int scanned_so_far_ = 0;
 };
 
-using RecordBatchGenerator = std::function<Future<std::shared_ptr<RecordBatch>>()>;
-
 Result<std::vector<std::string>> GetOrderedColumnNames(
     const csv::ReadOptions& read_options, const csv::ParseOptions& parse_options,
     std::string_view first_block, MemoryPool* pool) {
@@ -159,7 +162,17 @@ Result<std::vector<std::string>> GetOrderedColumnNames(
 
   uint32_t parsed_size = 0;
   int32_t max_num_rows = read_options.skip_rows + 1;
-  csv::BlockParser parser(pool, parse_options, /*num_cols=*/-1, /*first_row=*/1,
+  std::optional<csv::ParseOptions> inspection_parse_options;
+  const auto* parser_options = &parse_options;
+  if (parse_options.pad_short_rows || parse_options.ignore_extra_columns) {
+    // Do not adjust row widths while determining column names: padding cannot
+    // synthesize missing names, and ignoring extra columns may discard columns.
+    inspection_parse_options.emplace(parse_options);
+    inspection_parse_options->pad_short_rows = false;
+    inspection_parse_options->ignore_extra_columns = false;
+    parser_options = &*inspection_parse_options;
+  }
+  csv::BlockParser parser(pool, *parser_options, /*num_cols=*/-1, /*first_row=*/1,
                           max_num_rows);
 
   RETURN_NOT_OK(parser.Parse(std::string_view{first_block}, &parsed_size));
@@ -186,8 +199,9 @@ Result<std::vector<std::string>> GetOrderedColumnNames(
     return column_names;
   }
 
-  RETURN_NOT_OK(
-      parser.VisitLastRow([&](const uint8_t* data, uint32_t size, bool quoted) -> Status {
+  RETURN_NOT_OK(parser.VisitLastRow(
+      [&](const uint8_t* data, uint32_t size, bool quoted, bool missing) -> Status {
+        DCHECK(!missing);
         std::string_view view{reinterpret_cast<const char*>(data), size};
         column_names.emplace_back(view);
         return Status::OK();
@@ -348,6 +362,8 @@ static RecordBatchGenerator GeneratorFromReader(
   return MakeFromFuture(std::move(gen_fut));
 }
 
+}  // namespace
+
 CsvFileFormat::CsvFileFormat() : FileFormat(std::make_shared<CsvFragmentScanOptions>()) {}
 
 bool CsvFileFormat::Equals(const FileFormat& format) const {
@@ -363,7 +379,9 @@ bool CsvFileFormat::Equals(const FileFormat& format) const {
          parse_options.escaping == other_parse_options.escaping &&
          parse_options.escape_char == other_parse_options.escape_char &&
          parse_options.newlines_in_values == other_parse_options.newlines_in_values &&
-         parse_options.ignore_empty_lines == other_parse_options.ignore_empty_lines;
+         parse_options.ignore_empty_lines == other_parse_options.ignore_empty_lines &&
+         parse_options.pad_short_rows == other_parse_options.pad_short_rows &&
+         parse_options.ignore_extra_columns == other_parse_options.ignore_extra_columns;
 }
 
 Result<bool> CsvFileFormat::IsSupported(const FileSource& source) const {
@@ -420,6 +438,8 @@ Future<std::shared_ptr<FragmentScanner>> CsvFileFormat::BeginScan(
                               exec_context->executor());
 }
 
+namespace {
+
 Result<std::shared_ptr<InspectedFragment>> DoInspectFragment(
     const FileSource& source, const CsvFragmentScanOptions& csv_options,
     compute::ExecContext* exec_context) {
@@ -441,6 +461,8 @@ Result<std::shared_ptr<InspectedFragment>> DoInspectFragment(
   return std::make_shared<CsvInspectedFragment>(std::move(column_names), std::move(input),
                                                 source.Size());
 }
+
+}  // namespace
 
 Future<std::shared_ptr<InspectedFragment>> CsvFileFormat::InspectFragment(
     const FileSource& source, const FragmentScanOptions* format_options,
@@ -466,6 +488,7 @@ std::shared_ptr<FileWriteOptions> CsvFileFormat::DefaultWriteOptions() {
       new CsvFileWriteOptions(shared_from_this()));
   csv_options->write_options =
       std::make_shared<csv::WriteOptions>(csv::WriteOptions::Defaults());
+  csv_options->write_options->delimiter = parse_options.delimiter;
   return csv_options;
 }
 

@@ -42,8 +42,7 @@ static constexpr int kRowsPerBatch = 4;
 static constexpr int kNumBatches = 32;
 
 std::shared_ptr<Table> TestTable() {
-  return gen::Gen({{"up", gen::Step()},
-                   {"down", gen::Step(/*start=*/0, /*step=*/-1, /*signed_int=*/true)}})
+  return gen::Gen({{"up", gen::Step()}, {"down", gen::Step(/*start=*/0, /*step=*/-1)}})
       ->FailOnError()
       ->Table(kRowsPerBatch, kNumBatches);
 }
@@ -77,10 +76,10 @@ void CheckOrderByInvalid(OrderByNodeOptions options, const std::string& message)
 }
 
 TEST(OrderByNode, Basic) {
-  CheckOrderBy(OrderByNodeOptions({{SortKey("up")}}));
-  CheckOrderBy(OrderByNodeOptions({{SortKey("down", SortOrder::Descending)}}));
-  CheckOrderBy(
-      OrderByNodeOptions({{SortKey("up"), SortKey("down", SortOrder::Descending)}}));
+  CheckOrderBy(OrderByNodeOptions(Ordering{{SortKey("up")}}));
+  CheckOrderBy(OrderByNodeOptions(Ordering{{SortKey("down", SortOrder::Descending)}}));
+  CheckOrderBy(OrderByNodeOptions(
+      Ordering{{SortKey("up"), SortKey("down", SortOrder::Descending)}}));
 }
 
 TEST(OrderByNode, Large) {
@@ -95,7 +94,7 @@ TEST(OrderByNode, Large) {
                                      ->Table(ExecPlan::kMaxBatchSize, kSmallNumBatches);
   Declaration plan = Declaration::Sequence({
       {"table_source", TableSourceNodeOptions(input)},
-      {"order_by", OrderByNodeOptions({{SortKey("up", SortOrder::Descending)}})},
+      {"order_by", OrderByNodeOptions(Ordering{{SortKey("up", SortOrder::Descending)}})},
       {"jitter", JitterNodeOptions(kSeed, kJitterMod)},
   });
   ASSERT_OK_AND_ASSIGN(BatchesWithCommonSchema batches_and_schema,

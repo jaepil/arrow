@@ -6,6 +6,7 @@
 \alias{LocalFileSystem}
 \alias{S3FileSystem}
 \alias{GcsFileSystem}
+\alias{AzureFileSystem}
 \alias{SubTreeFileSystem}
 \title{FileSystem classes}
 \description{
@@ -57,6 +58,10 @@ in the background, without blocking (default \code{TRUE})
 buckets if \verb{$CreateDir()} is called on the bucket level (default \code{FALSE}).
 \item \code{allow_bucket_deletion}: logical, if TRUE, the filesystem will delete
 buckets if\verb{$DeleteDir()} is called on the bucket level (default \code{FALSE}).
+\item \code{check_directory_existence_before_creation}: logical, check if directory
+already exists or not before creation. Helpful for cloud storage operations
+where object mutation operations are rate limited or existing directories
+are read-only. (default \code{FALSE}).
 \item \code{request_timeout}: Socket read time on Windows and macOS in seconds. If
 negative, the AWS SDK default (typically 3 seconds).
 \item \code{connect_timeout}: Socket connection timeout in seconds. If negative, AWS
@@ -84,6 +89,33 @@ buckets in.
 the filesystem encounters errors. Default is 15 seconds.
 \item \code{default_metadata}: default metadata to write in new objects.
 \item \code{project_id}: the project to use for creating buckets.
+}
+
+\code{AzureFileSystem$create()} takes following required argument:
+\itemize{
+\item \code{account_name}: Azure Blob Storage account name.
+}
+
+\code{AzureFileSystem$create()} takes following optional arguments:
+\itemize{
+\item \code{account_key}: Account key of the storage account. Cannot be used with
+\code{sas_token}.
+\item \code{blob_storage_authority}: Hostname of the blob service, defaulting to
+\code{"blob.core.windows.net"}.
+\item \code{blob_storage_scheme}: Either \code{"http"} or \code{"https"} (the default).
+\item \code{client_id}: The client/application ID for Azure Active Directory
+authentication. If used with \code{client_secret} and \code{tenant_id} then it is the
+application ID for a registered Azure AD application. Otherwise, it is the
+client ID of a user-assigned managed identity.
+\item \code{client_secret}: Client secret for Azure Active Directory authentication.
+Must be provided with both \code{client_id} and \code{tenant_id}.
+\item \code{dfs_storage_authority}: Hostname of the data lake (gen 2) service,
+defaulting to \code{"dfs.core.windows.net"}.
+\item \code{dfs_storage_scheme}: Either \code{"http"} or \code{"https"} (the default).
+\item \code{sas_token}: Shared access signature (SAS) token for the storage account.
+Cannot be used with \verb{account key}.
+\item \code{tenant_id}: Tenant ID for Azure Active Directory authentication. Must
+be provided with both \code{client_id} and \code{client_secret}.
 }
 }
 
@@ -157,5 +189,12 @@ environment variable \code{ARROW_S3_LOG_LEVEL} (e.g.,
 to running any code that interacts with S3. Possible values include 'FATAL'
 (the default), 'ERROR', 'WARN', 'INFO', 'DEBUG' (recommended), 'TRACE', and
 'OFF'.
+
+On \code{AzureFileSystem}, passing no arguments for authentication uses the
+\code{AzureDefaultCredential} for authentication, so that several authentication
+types are tried until one succeeds.
+
+\code{AzureFileSystem} is not presently supported on Windows due to upstream
+compatibility issues between the Azure C++ SDK and the MinGW toolchain.
 }
 

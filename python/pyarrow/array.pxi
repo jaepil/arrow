@@ -15,12 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from cpython.pycapsule cimport PyCapsule_CheckExact, PyCapsule_GetPointer, PyCapsule_New
+from cpython.pycapsule cimport (
+    PyCapsule_CheckExact,
+    PyCapsule_GetPointer,
+    PyCapsule_New,
+    PyCapsule_SetName,
+)
 
+from collections.abc import Sequence
 import os
 import warnings
 from cython import sizeof
 
+cdef extern from "<variant>" namespace "std":
+    c_bool holds_alternative[T](...)
+    T get[T](...)
 
 cdef _sequence_to_array(object sequence, object mask, object size,
                         DataType type, CMemoryPool* pool, c_bool from_pandas):
@@ -117,6 +126,8 @@ def _handle_arrow_array_protocol(obj, type, mask, size):
                         "return a pyarrow Array or ChunkedArray.")
     if isinstance(res, ChunkedArray) and res.num_chunks==1:
         res = res.chunk(0)
+    if type is not None and res.type != type:
+        res = res.cast(type)
     return res
 
 
@@ -186,6 +197,12 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
     pa.int16() even if pa.int8() was passed to the function. Note that an
     explicit index type will not be demoted even if it is wider than required.
 
+    This class supports Python's standard operators
+    for element-wise operations, i.e. arithmetic (`+`, `-`, `/`, `%`, `**`),
+    bitwise (`&`, `|`, `^`, `>>`, `<<`) and others.
+    They can be used directly instead of calling underlying
+    `pyarrow.compute` functions explicitly.
+
     Examples
     --------
     >>> import pandas as pd
@@ -223,6 +240,25 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
     >>> arr = pa.array(range(1024), type=pa.dictionary(pa.int8(), pa.int64()))
     >>> arr.type.index_type
     DataType(int16)
+
+    >>> arr1 = pa.array([1, 2, 3], type=pa.int8())
+    >>> arr2 = pa.array([4, 5, 6], type=pa.int8())
+    >>> arr1 + arr2
+    <pyarrow.lib.Int8Array object at ...>
+    [
+      5,
+      7,
+      9
+    ]
+
+    >>> val = pa.scalar(42)
+    >>> val - arr1
+    <pyarrow.lib.Int64Array object at ...>
+    [
+      41,
+      40,
+      39
+    ]
     """
     cdef:
         CMemoryPool* pool = maybe_unbox_memory_pool(memory_pool)
@@ -235,6 +271,23 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
     if type is not None and type.id == _Type_EXTENSION:
         extension_type = type
         type = type.storage_type
+        # GH-49644: when building a fixed_shape_tensor from a sequence of arrays,
+        # the converter only sees the flat storage type, so validate the
+        # tensor-specific constraints here where the type is still known.
+        if (isinstance(extension_type, FixedShapeTensorType)
+                and isinstance(obj, (list, tuple))):
+            if extension_type.permutation is not None:
+                raise NotImplementedError(
+                    "Converting a sequence of arrays to a fixed_shape_tensor "
+                    "with a permutation is not supported")
+            expected_shape = tuple(extension_type.shape)
+            for element in obj:
+                shape = getattr(element, "shape", None)
+                if (shape is not None and len(shape) >= 2
+                        and tuple(shape) != expected_shape):
+                    raise ValueError(
+                        f"Cannot convert array of shape {tuple(shape)} to a "
+                        f"fixed_shape_tensor of shape {expected_shape}")
 
     if from_pandas is None:
         c_from_pandas = False
@@ -294,7 +347,7 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
                 values = values.data
 
         if mask is not None:
-            if mask.dtype != np.bool_:
+            if mask.dtype != np.bool:
                 raise TypeError("Mask must be boolean dtype")
             if mask.ndim != 1:
                 raise ValueError("Mask must be 1D array")
@@ -325,8 +378,8 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
                 values.codes, mask, index_type, memory_pool)
             try:
                 dictionary = array(
-                    values.categories.values, type=value_type,
-                    memory_pool=memory_pool)
+                    values.categories, type=value_type,
+                    from_pandas=True, memory_pool=memory_pool)
             except TypeError:
                 # TODO when removing the deprecation warning, this whole
                 # try/except can be removed (to bubble the TypeError of
@@ -334,14 +387,14 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
                 if value_type is not None:
                     warnings.warn(
                         "The dtype of the 'categories' of the passed "
-                        "categorical values ({0}) does not match the "
-                        "specified type ({1}). For now ignoring the specified "
+                        f"categorical values ({values.categories.dtype}) does not match the "
+                        f"specified type ({value_type}). For now ignoring the specified "
                         "type, but in the future this mismatch will raise a "
-                        "TypeError".format(
-                            values.categories.dtype, value_type),
+                        "TypeError",
                         FutureWarning, stacklevel=2)
                     dictionary = array(
-                        values.categories.values, memory_pool=memory_pool)
+                        values.categories, from_pandas=True,
+                        memory_pool=memory_pool)
                 else:
                     raise
 
@@ -370,7 +423,7 @@ def array(object obj, type=None, mask=None, size=None, from_pandas=None,
             result = _sequence_to_array(obj, mask, size, type, pool, c_from_pandas)
 
     if extension_type is not None:
-        result = ExtensionArray.from_storage(extension_type, result)
+        result = extension_type.wrap_array(result)
     return result
 
 
@@ -567,20 +620,53 @@ def infer_type(values, mask=None, from_pandas=False):
     return pyarrow_wrap_data_type(out)
 
 
+def arange(int64_t start, int64_t stop, int64_t step=1, *, memory_pool=None):
+    """
+    Create an array of evenly spaced values within a given interval.
+
+    This function is similar to Python's `range` function.
+    The resulting array will contain values starting from `start` up to but not
+    including `stop`, with a step size of `step`.
+
+    Parameters
+    ----------
+    start : int
+        The starting value for the sequence. The returned array will include this value.
+    stop : int
+        The stopping value for the sequence. The returned array will not include this value.
+    step : int, default 1
+        The spacing between values.
+    memory_pool : MemoryPool, optional
+        A memory pool to use for memory allocations.
+
+    Raises
+    ------
+    ArrowInvalid
+        If `step` is zero.
+
+    Returns
+    -------
+    arange : Array
+    """
+    cdef CMemoryPool* pool = maybe_unbox_memory_pool(memory_pool)
+    with nogil:
+        c_array = GetResultValue(Arange(start, stop, step, pool))
+    return pyarrow_wrap_array(c_array)
+
+
 def _normalize_slice(object arrow_obj, slice key):
     """
     Slices with step not equal to 1 (or None) will produce a copy
     rather than a zero-copy view
     """
     cdef:
-        Py_ssize_t start, stop, step
+        int64_t start, stop, step
         Py_ssize_t n = len(arrow_obj)
 
     start, stop, step = key.indices(n)
 
     if step != 1:
-        indices = np.arange(start, stop, step)
-        return arrow_obj.take(indices)
+        return arrow_obj.take(arange(start, stop, step))
     else:
         length = max(stop - start, 0)
         return arrow_obj.slice(start, length)
@@ -702,6 +788,127 @@ def _restore_array(data):
     return pyarrow_wrap_array(MakeArray(ad))
 
 
+cdef class ArrayStatistics(_Weakrefable):
+    """
+    The class for statistics of an array.
+    """
+
+    def __init__(self):
+        raise TypeError(f"Do not call {self.__class__.__name__}'s constructor "
+                        "directly")
+
+    cdef void init(self, const shared_ptr[CArrayStatistics]& sp_statistics):
+        self.sp_statistics = sp_statistics
+
+    def __repr__(self):
+        return (f"arrow.ArrayStatistics<null_count={self.null_count}, "
+                f"distinct_count={self.distinct_count}, min={self.min}, "
+                f"is_min_exact={self.is_min_exact}, max={self.max}, "
+                f"is_max_exact={self.is_max_exact}>")
+
+    @property
+    def null_count(self):
+        """
+        The number of nulls.
+        """
+        null_count = self.sp_statistics.get().null_count
+        # We'll be able to simplify this after
+        # https://github.com/cython/cython/issues/6692 is solved.
+        if not null_count.has_value():
+            return None
+        value = null_count.value()
+        if holds_alternative[int64_t](value):
+            return get[int64_t](value)
+        else:
+            return get[double](value)
+
+    @property
+    def is_null_count_exact(self):
+        """
+        Whether the number of null values is a valid exact value or not.
+        """
+        null_count = self.sp_statistics.get().null_count
+        if not null_count.has_value():
+            return False
+        value = null_count.value()
+        return holds_alternative[int64_t](value)
+
+    @property
+    def distinct_count(self):
+        """
+        The number of distinct values.
+        """
+        distinct_count = self.sp_statistics.get().distinct_count
+        if not distinct_count.has_value():
+            return None
+        value = distinct_count.value()
+        if holds_alternative[int64_t](value):
+            return get[int64_t](value)
+        else:
+            return get[double](value)
+
+    @property
+    def is_distinct_count_exact(self):
+        """
+        Whether the number of distinct values is a valid exact value or not.
+        """
+        distinct_count = self.sp_statistics.get().distinct_count
+        if not distinct_count.has_value():
+            return False
+        value = distinct_count.value()
+        return holds_alternative[int64_t](value)
+
+    @property
+    def min(self):
+        """
+        The minimum value.
+        """
+        return self._get_value(self.sp_statistics.get().min)
+
+    @property
+    def is_min_exact(self):
+        """
+        Whether the minimum value is an exact value or not.
+        """
+        return self.sp_statistics.get().is_min_exact
+
+    @property
+    def max(self):
+        """
+        The maximum value.
+        """
+        return self._get_value(self.sp_statistics.get().max)
+
+    @property
+    def is_max_exact(self):
+        """
+        Whether the maximum value is an exact value or not.
+        """
+        return self.sp_statistics.get().is_max_exact
+
+    cdef _get_value(self, const optional[CArrayStatisticsValueType]& optional_value):
+        """
+        Get a raw value from
+        std::optional<arrow::ArrayStatistics::ValueType>> data.
+
+        arrow::ArrayStatistics::ValueType is
+        std::variant<bool, int64_t, uint64_t, double, std::string>.
+        """
+        if not optional_value.has_value():
+            return None
+        value = optional_value.value()
+        if holds_alternative[c_bool](value):
+            return get[c_bool](value)
+        elif holds_alternative[int64_t](value):
+            return get[int64_t](value)
+        elif holds_alternative[uint64_t](value):
+            return get[uint64_t](value)
+        elif holds_alternative[double](value):
+            return get[double](value)
+        else:
+            return get[c_string](value)
+
+
 cdef class _PandasConvertible(_Weakrefable):
 
     def to_pandas(
@@ -743,14 +950,12 @@ cdef class _PandasConvertible(_Weakrefable):
             Cast integers with nulls to objects
         date_as_object : bool, default True
             Cast dates to objects. If False, convert to datetime64 dtype with
-            the equivalent time unit (if supported). Note: in pandas version
-            < 2.0, only datetime64[ns] conversion is supported.
+            the equivalent time unit (if supported).
         timestamp_as_object : bool, default False
-            Cast non-nanosecond timestamps (np.datetime64) to objects. This is
-            useful in pandas version 1.x if you have timestamps that don't fit
-            in the normal date range of nanosecond timestamps (1678 CE-2262 CE).
-            Non-nanosecond timestamps are supported in pandas version 2.0.
-            If False, all timestamps are converted to datetime64 dtype.
+            Cast non-nanosecond timestamps (np.datetime64) to objects. This can
+            be useful when Python datetime objects are required, such as for
+            compatibility with code expecting object dtype. If False, all
+            timestamps are converted to datetime64 dtype.
         use_threads : bool, default True
             Whether to parallelize the conversion using multiple threads.
         deduplicate_objects : bool, default True
@@ -761,9 +966,8 @@ cdef class _PandasConvertible(_Weakrefable):
             DataFrame index, if present
         safe : bool, default True
             For certain data types, a cast is needed in order to store the
-            data in a pandas DataFrame or Series (e.g. timestamps are always
-            stored as nanoseconds in pandas). This option controls whether it
-            is a safe cast or not.
+            data in a pandas DataFrame or Series. This option controls whether
+            it is a safe cast or not.
         split_blocks : bool, default False
             If True, generate one internal "block" for each column when
             creating a pandas.DataFrame from a RecordBatch or Table. While this
@@ -800,12 +1004,10 @@ cdef class _PandasConvertible(_Weakrefable):
             default conversion should be used for that type. If you have
             a dictionary mapping, you can pass ``dict.get`` as function.
         coerce_temporal_nanoseconds : bool, default False
-            Only applicable to pandas version >= 2.0.
             A legacy option to coerce date32, date64, duration, and timestamp
-            time units to nanoseconds when converting to pandas. This is the
-            default behavior in pandas version 1.x. Set this option to True if
-            you'd like to use this coercion when using pandas version >= 2.0
-            for backwards compatibility (not recommended otherwise).
+            time units to nanoseconds when converting to pandas. Set this
+            option only if nanosecond coercion is required for compatibility
+            with older application behavior.
 
         Returns
         -------
@@ -927,9 +1129,9 @@ cdef class Array(_PandasConvertible):
     """
 
     def __init__(self):
-        raise TypeError("Do not call {}'s constructor directly, use one of "
-                        "the `pyarrow.Array.from_*` functions instead."
-                        .format(self.__class__.__name__))
+        raise TypeError(f"Do not call {self.__class__.__name__}'s constructor "
+                        "directly, use one of the `pyarrow.Array.from_*` "
+                        "functions instead.")
 
     cdef void init(self, const shared_ptr[CArray]& sp_array) except *:
         self.sp_array = sp_array
@@ -963,7 +1165,6 @@ cdef class Array(_PandasConvertible):
         >>> left = pa.array(["one", "two", "three"])
         >>> right = pa.array(["two", None, "two-and-a-half", "three"])
         >>> print(left.diff(right)) # doctest: +SKIP
-
         @@ -0, +0 @@
         -"one"
         @@ -2, +1 @@
@@ -1145,7 +1346,7 @@ cdef class Array(_PandasConvertible):
             The value type of the array.
         length : int
             The number of values in the array.
-        buffers : List[Buffer]
+        buffers : List[Buffer | None]
             The buffers backing this array.
         null_count : int, default -1
             The number of null entries in the array. Negative value means that
@@ -1171,18 +1372,18 @@ cdef class Array(_PandasConvertible):
 
         if type.num_fields != len(children):
             raise ValueError("Type's expected number of children "
-                             "({0}) did not match the passed number "
-                             "({1}).".format(type.num_fields, len(children)))
+                             f"({type.num_fields}) did not match the passed number "
+                             f"({len(children)})")
 
         if type.has_variadic_buffers:
             if type.num_buffers > len(buffers):
                 raise ValueError("Type's expected number of buffers is at least "
-                                 "{0}, but the passed number is "
-                                 "{1}.".format(type.num_buffers, len(buffers)))
+                                 f"{type.num_buffers}, but the passed number is "
+                                 f"{len(buffers)}.")
         elif type.num_buffers != len(buffers):
             raise ValueError("Type's expected number of buffers "
-                             "({0}) did not match the passed number "
-                             "({1}).".format(type.num_buffers, len(buffers)))
+                             f"({type.num_buffers}) did not match the passed number "
+                             f"({len(buffers)}).")
 
         for buf in buffers:
             # None will produce a null buffer pointer
@@ -1254,10 +1455,11 @@ cdef class Array(_PandasConvertible):
 
     def __repr__(self):
         type_format = object.__repr__(self)
-        return '{0}\n{1}'.format(type_format, str(self))
+        return f'{type_format}\n{self}'
 
     def to_string(self, *, int indent=2, int top_level_indent=0, int window=10,
-                  int container_window=2, c_bool skip_new_lines=False):
+                  int container_window=2, c_bool skip_new_lines=False,
+                  int element_size_limit=100):
         """
         Render a "pretty-printed" string representation of the Array.
 
@@ -1283,6 +1485,8 @@ cdef class Array(_PandasConvertible):
         skip_new_lines : bool
             If the array should be rendered as a single line of text
             or if each element should be on its own line.
+        element_size_limit : int, default 100
+            Maximum number of characters of a single element before it is truncated.
         """
         cdef:
             c_string result
@@ -1292,6 +1496,7 @@ cdef class Array(_PandasConvertible):
             options = PrettyPrintOptions(top_level_indent, window)
             options.skip_new_lines = skip_new_lines
             options.indent_size = indent
+            options.element_size_limit = element_size_limit
             check_status(
                 PrettyPrint(
                     deref(self.ap),
@@ -1301,22 +1506,6 @@ cdef class Array(_PandasConvertible):
             )
 
         return frombytes(result, safe=True)
-
-    def format(self, **kwargs):
-        """
-        DEPRECATED, use pyarrow.Array.to_string
-
-        Parameters
-        ----------
-        **kwargs : dict
-
-        Returns
-        -------
-        str
-        """
-        import warnings
-        warnings.warn('Array.format is deprecated, use Array.to_string')
-        return self.to_string(**kwargs)
 
     def __str__(self):
         return self.to_string()
@@ -1534,7 +1723,7 @@ cdef class Array(_PandasConvertible):
         self._assert_cpu()
         return _pc().index(self, value, start, end, memory_pool=memory_pool)
 
-    def sort(self, order="ascending", **kwargs):
+    def sort(self, order="ascending", null_placement="at_end", **kwargs):
         """
         Sort the Array
 
@@ -1543,6 +1732,9 @@ cdef class Array(_PandasConvertible):
         order : str, default "ascending"
             Which order to sort values in.
             Accepted values are "ascending", "descending".
+        null_placement : str, default "at_end"
+            Whether nulls and NaNs are placed at the start or at the end.
+            Accepted values are "at_end", "at_start".
         **kwargs : dict, optional
             Additional sorting options.
             As allowed by :class:`SortOptions`
@@ -1554,7 +1746,7 @@ cdef class Array(_PandasConvertible):
         self._assert_cpu()
         indices = _pc().sort_indices(
             self,
-            options=_pc().SortOptions(sort_keys=[("", order)], **kwargs)
+            options=_pc().SortOptions(sort_keys=[("", order, null_placement)], **kwargs)
         )
         return self.take(indices)
 
@@ -1649,16 +1841,75 @@ cdef class Array(_PandasConvertible):
             array = array.copy()
         return array
 
-    def to_pylist(self):
+    def to_tensor(self, *, allow_nulls=False):
+        """
+        Convert this array to a pyarrow.Tensor.
+
+        This is supported when the data can reasonably be understood as a
+        multi-dimensional numeric tensor, such as numeric arrays (1D), nested
+        fixed size list arrays, and fixed shape tensor arrays.
+        The resulting tensor has a row major layout with the array elements
+        as the first dimension. The conversion is zero-copy.
+
+        Parameters
+        ----------
+        allow_nulls : bool, default `False`
+            When true, nulls are ignored, leaving the output tensor with
+            unspecified values where this array has null entries.
+            When false, nulls are rejected.
+
+        Returns
+        -------
+        pyarrow.Tensor
+        """
+        cdef:
+            shared_ptr[CTensor] ctensor
+            c_bool c_allow_nulls = allow_nulls
+        with nogil:
+            ctensor = GetResultValue(self.ap.ToTensor(c_allow_nulls))
+        return pyarrow_wrap_tensor(ctensor)
+
+    def to_pylist(self, *, maps_as_pydicts=None):
         """
         Convert to a list of native Python objects.
+
+        Parameters
+        ----------
+        maps_as_pydicts : str, optional, default `None`
+            Valid values are `None`, 'lossy', or 'strict'.
+            The default behavior (`None`), is to convert Arrow Map arrays to
+            Python association lists (list-of-tuples) in the same order as the
+            Arrow Map, as in [(key1, value1), (key2, value2), ...].
+
+            If 'lossy' or 'strict', convert Arrow Map arrays to native Python dicts.
+
+            If 'lossy', whenever duplicate keys are detected, a warning will be printed.
+            The last seen value of a duplicate key will be in the Python dictionary.
+            If 'strict', this instead results in an exception being raised when detected.
 
         Returns
         -------
         lst : list
         """
         self._assert_cpu()
-        return [x.as_py() for x in self]
+        cdef int64_t i, n = self.length()
+        if maps_as_pydicts is not None:
+            # Converting maps to dicts has per-entry semantics (duplicate-key
+            # detection); use the Scalar-based conversion for exact behavior.
+            # TODO(GH-50429): this falls back to the Scalar path for the whole
+            # array even when the type contains no maps; threading
+            # maps_as_pydicts through _getitem_py keeps the fast paths instead.
+            return [x.as_py(maps_as_pydicts=maps_as_pydicts) for x in self]
+        # TODO(GH-50448): convert per range instead of per element to cut
+        # the per-element call overhead further.
+        return [self._getitem_py(i) for i in range(n)]
+
+    cdef object _getitem_py(self, int64_t i):
+        # Return self[i] as a Python object, without creating a Python Scalar
+        # (nor, for nested types, per-row Array wrappers) where a subclass
+        # provides a specialization; this base implementation goes through
+        # Scalar.as_py and thus preserves its semantics exactly (see GH-50326).
+        return self.getitem(i).as_py()
 
     def tolist(self):
         """
@@ -2023,8 +2274,60 @@ cdef class Array(_PandasConvertible):
 
         return pyarrow_wrap_array(array)
 
-    def __dlpack__(self, stream=None):
-        """Export a primitive array as a DLPack capsule.
+    @staticmethod
+    def from_dlpack(x, /, *, device=None, copy=None):
+        """
+        Construct an Array from an object implementing the DLPack protocol.
+        Only 1-dimensional contiguous tensors are accepted as input.
+        For multi-dimensional tensors, use `Tensor.from_dlpack` or
+        `FixedShapeTensorArray.from_dlpack`.
+
+        Parameters
+        ----------
+        x : object
+            The input object containing array data, following the DLPack
+            protocol (has a ``__dlpack__`` method).
+        device : tuple[enum.Enum, int], optional
+            Designates where the resulting Array should reside, in the
+            format returned by :meth:`Array.__dlpack_device__`. When None,
+            the output Array occupies the same device as the source.
+            Default: None.
+        copy : bool, optional
+            Controls duplication behavior. True mandates copying; False
+            prohibits copying and raises ``BufferError`` if unavoidable;
+            None duplicates only when necessary. Default: None.
+
+        Returns
+        -------
+        Array
+            An Array housing the data from the input object, potentially
+            as a copy or view.
+        """
+        version = (DLPACK_VERSION.major, DLPACK_VERSION.minor)
+        pycapsule = x.__dlpack__(max_version=version, dl_device=device, copy=copy)
+        if not PyCapsule_CheckExact(pycapsule):
+            raise TypeError("DLPack producer did not return a PyCapsule")
+        cdef DLManagedTensorVersioned* ptr = <DLManagedTensorVersioned*>PyCapsule_GetPointer(
+            pycapsule, "dltensor_versioned")
+        if ptr == NULL:
+            raise ValueError(
+                'DLPack producer did not produce a "dltensor_versioned" PyCapsule')
+        # Mark the capsule as consumed so its destructor does not also invoke the deleter.
+        # ImportArrayVersionedFromDLPack will take ownership even if it errors (calling
+        # the deleter in that case).
+        PyCapsule_SetName(pycapsule, "used_dltensor_versioned")
+        with nogil:
+            # Copy handled on producer side
+            result = ImportArrayVersionedFromDLPack(ptr)
+        carray = GetResultValue(result)
+        return pyarrow_wrap_array(carray)
+
+    def __dlpack__(self, *, stream=None, max_version=None, dl_device=None, copy=None):
+        """
+        Export a primitive array as a DLPack capsule.
+
+        Without supplying max_version, it will return a legacy DLPack "dltensor" PyCapsule.
+        Please specify a version as the legacy path is deprecated.
 
         Parameters
         ----------
@@ -2032,20 +2335,54 @@ cdef class Array(_PandasConvertible):
             A Python integer representing a pointer to a stream. Currently not supported.
             Stream is provided by the consumer to the producer to instruct the producer
             to ensure that operations can safely be performed on the array.
+        max_version : tuple[int, int], optional
+            The maximum DLPack version the consumer supports, as (major, minor).
+            A capsule of a different version may be returned, so the consumer must
+            check it. Default is None, exporting the unversioned capsule.
+        dl_device : tuple[enum.Enum, int], optional
+            The device of the exported capsule, in the format returned by
+            :meth:`__dlpack_device__`. Default is None, meaning the device of the
+            array itself. Since only CPU arrays are supported, any other device
+            raises ``BufferError``.
+        copy : bool, optional
+            If True, the data is always copied. If False, it is never copied and
+            ``BufferError`` is raised if a copy is required. If None (default), the
+            data is copied only if needed, which for CPU arrays is never.
+            A copy is reported to the consumer with ``DLPACK_FLAG_BITMASK_IS_COPIED``.
 
         Returns
         -------
         capsule : PyCapsule
-            A DLPack capsule for the array, pointing to a DLManagedTensor.
+            A DLPack capsule for the array, pointing to a DLManagedTensorVersioned,
+            or to a DLManagedTensor if ``max_version`` is below (1, 0).
         """
-        if stream is None:
-            dlm_tensor = GetResultValue(ExportToDLPack(self.sp_array))
+        if stream is not None:
+            raise NotImplementedError("Only stream=None is supported.")
+        if dl_device is not None:
+            device = GetResultValue(ExportDevice(self.sp_array))
+            if dl_device != (device.device_type, device.device_id):
+                raise BufferError(
+                    f"Cannot export to device {dl_device}, "
+                    f"array is on {(device.device_type, device.device_id)}."
+                )
+        if max_version is None or max_version < (1, 0):
+            if copy is not None:
+                raise BufferError(
+                    f"The copy argument is not supported with legacy (pre 1.0) DLPack version."
+                )
+            # Note: from March 2025 onwards, it's okay to raise BufferError here.
+            # Still we keep the V0 version as the V1 was only added in August 2026.
+            warnings.warn(
+                "Exporting an unversioned DLPack capsule is deprecated, "
+                "pass max_version=(1, 0) or higher.",
+                DeprecationWarning, stacklevel=2)
+            legacy_tensor = GetResultValue(ExportArrayToDLPack(self.sp_array))
+            return PyCapsule_New(legacy_tensor, 'dltensor', dlpack_pycapsule_deleter)
 
-            return PyCapsule_New(dlm_tensor, 'dltensor', dlpack_pycapsule_deleter)
-        else:
-            raise NotImplementedError(
-                "Only stream=None is supported."
-            )
+        # Currently no major version other than legacy 0 and current 1.3
+        dlm_tensor = GetResultValue(
+            ExportArrayVersionedToDLPack(self.sp_array, copy == True))
+        return PyCapsule_New(dlm_tensor, 'dltensor_versioned', dlpack_versioned_pycapsule_deleter)
 
     def __dlpack_device__(self):
         """
@@ -2083,6 +2420,68 @@ cdef class Array(_PandasConvertible):
         if self.sp_array.get().device_type() != CDeviceAllocationType_kCPU:
             raise NotImplementedError("Implemented only for data on CPU device")
 
+    @property
+    def statistics(self):
+        """
+        Statistics of the array.
+        """
+        cdef ArrayStatistics stat
+        sp_stat = self.sp_array.get().statistics()
+        if sp_stat.get() == nullptr:
+            return None
+        else:
+            stat = ArrayStatistics.__new__(ArrayStatistics)
+            stat.init(sp_stat)
+            return stat
+
+    def __abs__(self):
+        self._assert_cpu()
+        return _pc().call_function('abs_checked', [self])
+
+    def __add__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('add_checked', [self, other])
+
+    def __truediv__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('divide_checked', [self, other])
+
+    def __mul__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('multiply_checked', [self, other])
+
+    def __neg__(self):
+        self._assert_cpu()
+        return _pc().call_function('negate_checked', [self])
+
+    def __pow__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('power_checked', [self, other])
+
+    def __sub__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('subtract_checked', [self, other])
+
+    def __and__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('bit_wise_and', [self, other])
+
+    def __or__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('bit_wise_or', [self, other])
+
+    def __xor__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('bit_wise_xor', [self, other])
+
+    def __lshift__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('shift_left_checked', [self, other])
+
+    def __rshift__(self, object other):
+        self._assert_cpu()
+        return _pc().call_function('shift_right_checked', [self, other])
+
 
 cdef _array_like_to_pandas(obj, options, types_mapper):
     cdef:
@@ -2100,16 +2499,19 @@ cdef _array_like_to_pandas(obj, options, types_mapper):
             dtype = original_type.to_pandas_dtype()
         except NotImplementedError:
             pass
+    elif pandas_api.uses_string_dtype() and not options["strings_to_categorical"] and (
+        original_type.id == _Type_STRING or
+        original_type.id == _Type_LARGE_STRING or
+        original_type.id == _Type_STRING_VIEW
+    ):
+        # for pandas 3.0+, use pandas' new default string dtype
+        dtype = pandas_api.pd.StringDtype(na_value=np.nan)
 
     # Only call __from_arrow__ for Arrow extension types or when explicitly
     # overridden via types_mapper
     if hasattr(dtype, '__from_arrow__'):
         arr = dtype.__from_arrow__(obj)
         return pandas_api.series(arr, name=name, copy=False)
-
-    if pandas_api.is_v1():
-        # ARROW-3789: Coerce date/timestamp types to datetime64[ns]
-        c_options.coerce_temporal_nanoseconds = True
 
     if isinstance(obj, Array):
         with nogil:
@@ -2168,6 +2570,12 @@ cdef class BooleanArray(Array):
     """
     Concrete class for Arrow arrays of boolean data type.
     """
+
+    cdef object _getitem_py(self, int64_t i):
+        if self.ap.IsNull(i):
+            return None
+        return (<CBooleanArray*> self.ap).Value(i)
+
     @property
     def false_count(self):
         return (<CBooleanArray*> self.ap).false_count()
@@ -2181,6 +2589,34 @@ cdef class NumericArray(Array):
     """
     A base class for Arrow numeric arrays.
     """
+
+    cdef object _getitem_py(self, int64_t i):
+        cdef Type tid = self.ap.type_id()
+        if self.ap.IsNull(i):
+            return None
+        if tid == _Type_INT8:
+            return (<CInt8Array*> self.ap).Value(i)
+        elif tid == _Type_INT16:
+            return (<CInt16Array*> self.ap).Value(i)
+        elif tid == _Type_INT32:
+            return (<CInt32Array*> self.ap).Value(i)
+        elif tid == _Type_INT64:
+            return (<CInt64Array*> self.ap).Value(i)
+        elif tid == _Type_UINT8:
+            return (<CUInt8Array*> self.ap).Value(i)
+        elif tid == _Type_UINT16:
+            return (<CUInt16Array*> self.ap).Value(i)
+        elif tid == _Type_UINT32:
+            return (<CUInt32Array*> self.ap).Value(i)
+        elif tid == _Type_UINT64:
+            return (<CUInt64Array*> self.ap).Value(i)
+        elif tid == _Type_FLOAT:
+            return (<CFloatArray*> self.ap).Value(i)
+        elif tid == _Type_DOUBLE:
+            return (<CDoubleArray*> self.ap).Value(i)
+        # Subclasses whose as_py returns non-primitive objects (dates, times,
+        # timestamps, durations, half floats, ...) use the exact Scalar path.
+        return Array._getitem_py(self, i)
 
 
 cdef class IntegerArray(NumericArray):
@@ -2284,11 +2720,17 @@ cdef class MonthDayNanoIntervalArray(Array):
     Concrete class for Arrow arrays of interval[MonthDayNano] type.
     """
 
-    def to_pylist(self):
+    def to_pylist(self, *, maps_as_pydicts=None):
         """
         Convert to a list of native Python objects.
 
         pyarrow.MonthDayNano is used as the native representation.
+
+        Parameters
+        ----------
+        maps_as_pydicts : str, optional, default `None`
+            Valid values are `None`, 'lossy', or 'strict'.
+            This parameter is ignored for non-nested Scalars.
 
         Returns
         -------
@@ -2327,6 +2769,15 @@ cdef class FixedSizeBinaryArray(Array):
     Concrete class for Arrow arrays of a fixed-size binary data type.
     """
 
+cdef class Decima32Array(FixedSizeBinaryArray):
+    """
+    Concrete class for Arrow arrays of decimal32 data type.
+    """
+
+cdef class Decimal64Array(FixedSizeBinaryArray):
+    """
+    Concrete class for Arrow arrays of decimal64 data type.
+    """
 
 cdef class Decimal128Array(FixedSizeBinaryArray):
     """
@@ -2366,6 +2817,7 @@ cdef class BaseListArray(Array):
         --------
 
         Basic logical list-array's flatten
+
         >>> import pyarrow as pa
         >>> values = [1, 2, 3, 4]
         >>> offsets = [2, 1, 0]
@@ -2483,6 +2935,16 @@ cdef class ListArray(BaseListArray):
     """
     Concrete class for Arrow arrays of a list data type.
     """
+
+    cdef object _getitem_py(self, int64_t i):
+        cdef CListArray* arr = <CListArray*> self.ap
+        if arr.IsNull(i):
+            return None
+        if self._children_cache is None:
+            self._children_cache = pyarrow_wrap_array(arr.values())
+        cdef Array values = <Array> self._children_cache
+        cdef int64_t j, start = arr.value_offset(i), end = arr.value_offset(i + 1)
+        return [values._getitem_py(j) for j in range(start, end)]
 
     @staticmethod
     def from_arrays(offsets, values, DataType type=None, MemoryPool pool=None, mask=None):
@@ -2668,6 +3130,16 @@ cdef class LargeListArray(BaseListArray):
 
     Identical to ListArray, but 64-bit offsets.
     """
+
+    cdef object _getitem_py(self, int64_t i):
+        cdef CLargeListArray* arr = <CLargeListArray*> self.ap
+        if arr.IsNull(i):
+            return None
+        if self._children_cache is None:
+            self._children_cache = pyarrow_wrap_array(arr.values())
+        cdef Array values = <Array> self._children_cache
+        cdef int64_t j, start = arr.value_offset(i), end = arr.value_offset(i + 1)
+        return [values._getitem_py(j) for j in range(start, end)]
 
     @staticmethod
     def from_arrays(offsets, values, DataType type=None, MemoryPool pool=None, mask=None):
@@ -3259,6 +3731,19 @@ cdef class MapArray(ListArray):
     Concrete class for Arrow arrays of a map data type.
     """
 
+    cdef object _getitem_py(self, int64_t i):
+        cdef CListArray* arr = <CListArray*> self.ap
+        if arr.IsNull(i):
+            return None
+        if self._children_cache is None:
+            self._children_cache = (self.keys, self.items)
+        cdef Array keys = <Array> (<tuple> self._children_cache)[0]
+        cdef Array items = <Array> (<tuple> self._children_cache)[1]
+        cdef int64_t j, start = arr.value_offset(i), end = arr.value_offset(i + 1)
+        # Matches MapScalar.as_py with the default maps_as_pydicts=None:
+        # an association list of (key, value) tuples.
+        return [(keys._getitem_py(j), items._getitem_py(j)) for j in range(start, end)]
+
     @staticmethod
     def from_arrays(offsets, keys, items, DataType type=None, MemoryPool pool=None, mask=None):
         """
@@ -3396,6 +3881,16 @@ cdef class FixedSizeListArray(BaseListArray):
     Concrete class for Arrow arrays of a fixed size list data type.
     """
 
+    cdef object _getitem_py(self, int64_t i):
+        cdef CFixedSizeListArray* arr = <CFixedSizeListArray*> self.ap
+        if arr.IsNull(i):
+            return None
+        if self._children_cache is None:
+            self._children_cache = pyarrow_wrap_array(arr.values())
+        cdef Array values = <Array> self._children_cache
+        cdef int64_t j, start = arr.value_offset(i), end = arr.value_offset(i + 1)
+        return [values._getitem_py(j) for j in range(start, end)]
+
     @staticmethod
     def from_arrays(values, list_size=None, DataType type=None, mask=None):
         """
@@ -3485,7 +3980,7 @@ cdef class FixedSizeListArray(BaseListArray):
     def values(self):
         """
         Return the underlying array of values which backs the
-        FixedSizeListArray.
+        FixedSizeListArray ignoring the array's offset.
 
         Note even null elements are included.
 
@@ -3569,7 +4064,7 @@ cdef class UnionArray(Array):
         result = (<CUnionArray*> self.ap).field(pos)
         if result != NULL:
             return pyarrow_wrap_array(result)
-        raise KeyError("UnionArray does not have child {}".format(pos))
+        raise KeyError(f"UnionArray does not have child {pos}")
 
     @property
     def type_codes(self):
@@ -3682,6 +4177,13 @@ cdef class StringArray(Array):
     Concrete class for Arrow arrays of string (or utf8) data type.
     """
 
+    cdef object _getitem_py(self, int64_t i):
+        if self.ap.IsNull(i):
+            return None
+        cdef cpp_string_view view = (<CBinaryArray*> self.ap).GetView(i)
+        # Matches StringScalar.as_py, which is str(buf, 'utf8').
+        return cp.PyUnicode_DecodeUTF8(view.data(), <Py_ssize_t> view.size(), NULL)
+
     @staticmethod
     def from_buffers(int length, Buffer value_offsets, Buffer data,
                      Buffer null_bitmap=None, int null_count=-1,
@@ -3713,6 +4215,12 @@ cdef class LargeStringArray(Array):
     """
     Concrete class for Arrow arrays of large string (or utf8) data type.
     """
+
+    cdef object _getitem_py(self, int64_t i):
+        if self.ap.IsNull(i):
+            return None
+        cdef cpp_string_view view = (<CLargeBinaryArray*> self.ap).GetView(i)
+        return cp.PyUnicode_DecodeUTF8(view.data(), <Py_ssize_t> view.size(), NULL)
 
     @staticmethod
     def from_buffers(int length, Buffer value_offsets, Buffer data,
@@ -3746,11 +4254,24 @@ cdef class StringViewArray(Array):
     Concrete class for Arrow arrays of string (or utf8) view data type.
     """
 
+    cdef object _getitem_py(self, int64_t i):
+        if self.ap.IsNull(i):
+            return None
+        cdef cpp_string_view view = (<CBinaryViewArray*> self.ap).GetView(i)
+        return cp.PyUnicode_DecodeUTF8(view.data(), <Py_ssize_t> view.size(), NULL)
+
 
 cdef class BinaryArray(Array):
     """
     Concrete class for Arrow arrays of variable-sized binary data type.
     """
+
+    cdef object _getitem_py(self, int64_t i):
+        if self.ap.IsNull(i):
+            return None
+        cdef cpp_string_view view = (<CBinaryArray*> self.ap).GetView(i)
+        return cp.PyBytes_FromStringAndSize(view.data(), <Py_ssize_t> view.size())
+
     @property
     def total_values_length(self):
         """
@@ -3764,6 +4285,13 @@ cdef class LargeBinaryArray(Array):
     """
     Concrete class for Arrow arrays of large variable-sized binary data type.
     """
+
+    cdef object _getitem_py(self, int64_t i):
+        if self.ap.IsNull(i):
+            return None
+        cdef cpp_string_view view = (<CLargeBinaryArray*> self.ap).GetView(i)
+        return cp.PyBytes_FromStringAndSize(view.data(), <Py_ssize_t> view.size())
+
     @property
     def total_values_length(self):
         """
@@ -3777,6 +4305,12 @@ cdef class BinaryViewArray(Array):
     """
     Concrete class for Arrow arrays of variable-sized binary view data type.
     """
+
+    cdef object _getitem_py(self, int64_t i):
+        if self.ap.IsNull(i):
+            return None
+        cdef cpp_string_view view = (<CBinaryViewArray*> self.ap).GetView(i)
+        return cp.PyBytes_FromStringAndSize(view.data(), <Py_ssize_t> view.size())
 
 
 cdef class DictionaryArray(Array):
@@ -3822,7 +4356,7 @@ cdef class DictionaryArray(Array):
         type : pyarrow.DataType
         length : int
             The number of values in the array.
-        buffers : List[Buffer]
+        buffers : List[Buffer | None]
             The buffers backing the indices array.
         dictionary : pyarrow.Array, ndarray or pandas.Series
             The array of values referenced by the indices.
@@ -3937,6 +4471,28 @@ cdef class StructArray(Array):
     Concrete class for Arrow arrays of a struct data type.
     """
 
+    cdef object _getitem_py(self, int64_t i):
+        if self.ap.IsNull(i):
+            return None
+        cdef int64_t k, num_fields = self.type.num_fields
+        if self._children_cache is None:
+            names = [self.type.field(k).name for k in range(num_fields)]
+            if len(set(names)) != len(names):
+                # Matches StructScalar.as_py
+                raise ValueError(
+                    "Converting to Python dictionary is not supported when "
+                    "duplicate field names are present")
+            self._children_cache = (
+                names, [self.field(k) for k in range(num_fields)])
+        names = (<tuple> self._children_cache)[0]
+        fields = (<tuple> self._children_cache)[1]
+        cdef Array field_arr
+        result = {}
+        for k in range(num_fields):
+            field_arr = <Array> fields[k]
+            result[names[k]] = field_arr._getitem_py(i)
+        return result
+
     def field(self, index):
         """
         Retrieves the child array belonging to field.
@@ -4043,7 +4599,7 @@ cdef class StructArray(Array):
         memory_pool : MemoryPool (optional)
             For memory allocations, if required, otherwise uses default pool.
         type : pyarrow.StructType (optional)
-            Struct type for name and type of each child. 
+            Struct type for name and type of each child.
 
         Returns
         -------
@@ -4114,7 +4670,7 @@ cdef class StructArray(Array):
         result.validate()
         return result
 
-    def sort(self, order="ascending", by=None, **kwargs):
+    def sort(self, order="ascending", null_placement="at_end", by=None, **kwargs):
         """
         Sort the StructArray
 
@@ -4123,6 +4679,9 @@ cdef class StructArray(Array):
         order : str, default "ascending"
             Which order to sort values in.
             Accepted values are "ascending", "descending".
+        null_placement : str, default "at_end"
+            Whether nulls and NaNs are placed at the start or at the end.
+            Accepted values are "at_end", "at_start".
         by : str or None, default None
             If to sort the array by one of its fields
             or by the whole array.
@@ -4135,9 +4694,10 @@ cdef class StructArray(Array):
         result : StructArray
         """
         if by is not None:
-            tosort, sort_keys = self._flattened_field(by), [("", order)]
+            tosort, sort_keys = self._flattened_field(by), [("", order, null_placement)]
         else:
-            tosort, sort_keys = self, [(field.name, order) for field in self.type]
+            tosort, sort_keys = self, [
+                (field.name, order, null_placement) for field in self.type]
         indices = _pc().sort_indices(
             tosort, options=_pc().SortOptions(sort_keys=sort_keys, **kwargs)
         )
@@ -4238,8 +4798,8 @@ cdef class RunEndEncodedArray(Array):
 
         if type.num_fields != len(children):
             raise ValueError("RunEndEncodedType's expected number of children "
-                             "({0}) did not match the passed number "
-                             "({1}).".format(type.num_fields, len(children)))
+                             f"({type.num_fields}) did not match the passed number "
+                             f"({len(children)})")
 
         # buffers are validated as if we needed to pass them to C++, but
         # _make_from_arrays will take care of filling in the expected
@@ -4251,13 +4811,13 @@ cdef class RunEndEncodedArray(Array):
                              "bitmap, buffers[0] is not None")
         if type.num_buffers != len(buffers):
             raise ValueError("RunEndEncodedType's expected number of buffers "
-                             "({0}) did not match the passed number "
-                             "({1}).".format(type.num_buffers, len(buffers)))
+                             f"({type.num_buffers}) did not match the passed number "
+                             f"({len(buffers)}).")
 
         # null_count is also validated as if we needed it
         if null_count != -1 and null_count != 0:
             raise ValueError("RunEndEncodedType's expected null_count (0) "
-                             "did not match passed number ({0})".format(null_count))
+                             f"did not match passed number ({null_count})")
 
         return RunEndEncodedArray._from_arrays(type, False, length, children[0],
                                                children[1], offset)
@@ -4336,15 +4896,12 @@ cdef class ExtensionArray(Array):
         -------
         ext_array : ExtensionArray
         """
-        cdef:
-            shared_ptr[CExtensionArray] ext_array
-
         if storage.type != typ.storage_type:
-            raise TypeError("Incompatible storage type {0} "
-                            "for extension type {1}".format(storage.type, typ))
+            raise TypeError(f"Incompatible storage type {storage.type} "
+                            f"for extension type {typ}")
 
-        ext_array = make_shared[CExtensionArray](typ.sp_type, storage.sp_array)
-        cdef Array result = pyarrow_wrap_array(<shared_ptr[CArray]> ext_array)
+        cdef Array result = pyarrow_wrap_array(
+            typ.ext_type.WrapArray(typ.sp_type, storage.sp_array))
         result.validate()
         return result
 
@@ -4419,6 +4976,30 @@ cdef class FixedShapeTensorArray(ExtensionArray):
         400
       ]
     ]
+
+    Create an extension array from a list of multi-dimensional NumPy arrays.
+    Each element is flattened in row-major (C) order, and its shape must match
+    the tensor shape.
+
+    >>> import numpy as np
+    >>> pa.array([np.array([[1, 2], [3, 4]], dtype=np.int32),
+    ...           np.array([[10, 20], [30, 40]], dtype=np.int32)],
+    ...          type=tensor_type)
+    <pyarrow.lib.FixedShapeTensorArray object at ...>
+    [
+      [
+        1,
+        2,
+        3,
+        4
+      ],
+      [
+        10,
+        20,
+        30,
+        40
+      ]
+    ]
     """
 
     def to_numpy_ndarray(self):
@@ -4441,33 +5022,34 @@ cdef class FixedShapeTensorArray(ExtensionArray):
 
         return self.to_tensor().to_numpy()
 
-    def to_tensor(self):
+    @staticmethod
+    def from_tensor(Tensor tensor not None):
         """
-        Convert fixed shape tensor extension array to a pyarrow.Tensor.
+        Convert a pyarrow.Tensor to a fixed shape tensor extension array.
 
-        The resulting Tensor will have (ndim + 1) dimensions.
-        The size of the first dimension will be the length of the fixed shape tensor array
-        and the rest of the dimensions will match the permuted shape of the fixed
-        shape tensor.
+        The first dimension of the tensor becomes the length of the fixed shape
+        tensor array and the remaining dimensions the shape of the individual
+        tensors. If the tensor provides strides, they are used to determine the
+        dimension permutation, otherwise row-major layout is assumed.
 
-        The conversion is zero-copy.
+        Parameters
+        ----------
+        tensor : pyarrow.Tensor
 
         Returns
         -------
-        pyarrow.Tensor
-            Tensor representing tensors in the fixed shape tensor array concatenated
-            along the first dimension.
+        FixedShapeTensorArray
         """
+        cdef shared_ptr[CFixedShapeTensorArray] c_array
 
-        cdef:
-            CFixedShapeTensorArray* ext_array = <CFixedShapeTensorArray*>(self.ap)
-            CResult[shared_ptr[CTensor]] ctensor
         with nogil:
-            ctensor = ext_array.ToTensor()
-        return pyarrow_wrap_tensor(GetResultValue(ctensor))
+            c_array = GetResultValue(
+                CFixedShapeTensorArray.FromTensor(tensor.sp_tensor))
+
+        return pyarrow_wrap_array(<shared_ptr[CArray]> c_array)
 
     @staticmethod
-    def from_numpy_ndarray(obj):
+    def from_numpy_ndarray(obj, dim_names=None):
         """
         Convert numpy tensors (ndarrays) to a fixed shape tensor extension array.
         The first dimension of ndarray will become the length of the fixed
@@ -4477,6 +5059,8 @@ cdef class FixedShapeTensorArray(ExtensionArray):
         Parameters
         ----------
         obj : numpy.ndarray
+        dim_names : tuple or list of strings, default None
+            Explicit names to tensor dimensions.
 
         Examples
         --------
@@ -4512,6 +5096,17 @@ cdef class FixedShapeTensorArray(ExtensionArray):
                 "Cannot convert 1D array or scalar to fixed shape tensor array")
         if np.prod(obj.shape) == 0:
             raise ValueError("Expected a non-empty ndarray")
+        if dim_names is not None:
+            if not isinstance(dim_names, Sequence):
+                raise TypeError("dim_names must be a tuple or list")
+            if len(dim_names) != len(obj.shape[1:]):
+                raise ValueError(
+                    (f"The length of dim_names ({len(dim_names)}) does not match"
+                     f"the number of tensor dimensions ({len(obj.shape[1:])})."
+                     )
+                )
+            if not all(isinstance(name, str) for name in dim_names):
+                raise TypeError("Each element of dim_names must be a string")
 
         permutation = (-np.array(obj.strides)).argsort(kind='stable')
         if permutation[0] != 0:
@@ -4523,8 +5118,59 @@ cdef class FixedShapeTensorArray(ExtensionArray):
         values = np.ravel(obj, order="K")
 
         return ExtensionArray.from_storage(
-            fixed_shape_tensor(arrow_type, shape[1:], permutation=permutation[1:] - 1),
+            fixed_shape_tensor(arrow_type, shape[1:],
+                               dim_names=dim_names,
+                               permutation=permutation[1:] - 1),
             FixedSizeListArray.from_arrays(values, shape[1:].prod())
+        )
+
+    @staticmethod
+    def from_dlpack(x, /, *, device=None, copy=None):
+        """
+        Construct a FixedShapeTensorArray from an object implementing the DLPack
+        protocol.
+
+        The outermost dimension of the input becomes the length of the tensor
+        array, and the remaining dimensions the shape of the individual tensors.
+        The outermost dimension must have the largest stride.
+
+        Parameters
+        ----------
+        x : object
+            The input object containing array data, following the DLPack
+            protocol (has a ``__dlpack__`` method).
+        device : tuple[enum.Enum, int], optional
+            Designates where the resulting array should reside, in the
+            format returned by :meth:`Array.__dlpack_device__`. When None,
+            the output array occupies the same device as the source.
+            Default: None.
+        copy : bool, optional
+            Controls duplication behavior. True mandates copying; False
+            prohibits copying and raises ``BufferError`` if unavoidable;
+            None duplicates only when necessary. Default: None.
+
+        Returns
+        -------
+        FixedShapeTensorArray
+            An array housing the data from the input object, potentially
+            as a copy or view.
+
+        """
+        return FixedShapeTensorArray.from_tensor(
+            Tensor.from_dlpack(x, device=device, copy=copy))
+
+    def __dlpack__(self, *, stream=None, max_version=None, dl_device=None, copy=None):
+        """
+        Export a tensor array as a DLPack capsule.
+
+        The element positions in the array become the first dimension of the
+        resulting tensor (equal to ``len(self)``).
+
+        See :meth:`Tensor.__dlpack__` for the parameter semantics.
+        """
+        return self.to_tensor().__dlpack__(
+            stream=stream, max_version=max_version,
+            dl_device=dl_device, copy=copy,
         )
 
 
@@ -4607,7 +5253,7 @@ cdef class Bool8Array(ExtensionArray):
         """
         if not writable:
             try:
-                return self.storage.to_numpy().view(np.bool_)
+                return self.storage.to_numpy().view(np.bool)
             except ArrowInvalid as e:
                 if zero_copy_only:
                     raise e
@@ -4634,7 +5280,7 @@ cdef class Bool8Array(ExtensionArray):
     def from_numpy(obj):
         """
         Convert numpy array to a bool8 extension array without making a copy.
-        The input array must be 1-dimensional, with either bool_ or int8 dtype.
+        The input array must be 1-dimensional, with either ``bool_`` or ``int8`` dtype.
 
         Parameters
         ----------
@@ -4648,7 +5294,7 @@ cdef class Bool8Array(ExtensionArray):
         --------
         >>> import pyarrow as pa
         >>> import numpy as np
-        >>> arr = np.array([True, False, True], dtype=np.bool_)
+        >>> arr = np.array([True, False, True], dtype=np.bool)
         >>> pa.Bool8Array.from_numpy(arr)
         <pyarrow.lib.Bool8Array object at ...>
         [
@@ -4661,7 +5307,7 @@ cdef class Bool8Array(ExtensionArray):
         if obj.ndim != 1:
             raise ValueError(f"Cannot convert {obj.ndim}-D array to bool8 array")
 
-        if obj.dtype not in [np.bool_, np.int8]:
+        if obj.dtype not in [np.bool, np.int8]:
             raise TypeError(f"Array dtype {obj.dtype} incompatible with bool8 storage")
 
         storage_arr = array(obj.view(np.int8), type=int8())
@@ -4705,6 +5351,8 @@ cdef dict _array_classes = {
     _Type_STRING_VIEW: StringViewArray,
     _Type_DICTIONARY: DictionaryArray,
     _Type_FIXED_SIZE_BINARY: FixedSizeBinaryArray,
+    _Type_DECIMAL32: Decimal32Array,
+    _Type_DECIMAL64: Decimal64Array,
     _Type_DECIMAL128: Decimal128Array,
     _Type_DECIMAL256: Decimal256Array,
     _Type_STRUCT: StructArray,
@@ -4802,7 +5450,7 @@ def concat_arrays(arrays, MemoryPool memory_pool=None):
     for array in arrays:
         if not isinstance(array, Array):
             raise TypeError("Iterable should contain Array objects, "
-                            "got {0} instead".format(type(array)))
+                            f"got {type(array)} instead")
         c_arrays.push_back(pyarrow_unwrap_array(array))
 
     with nogil:

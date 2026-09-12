@@ -58,14 +58,13 @@
 #include "arrow/status.h"
 #include "arrow/type.h"
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/string.h"
 #include "arrow/util/uri.h"
 
 namespace arrow {
 
 using internal::checked_cast;
-using internal::StartsWith;
 using internal::ToChars;
 using util::UriFromAbsolutePath;
 
@@ -93,6 +92,8 @@ Result<EmitInfo> GetEmitInfo(const RelMessage& rel,
   emit_info.schema = schema(std::move(emit_fields));
   return emit_info;
 }
+
+namespace {
 
 Result<DeclarationInfo> ProcessEmitProject(
     std::optional<substrait::RelCommon> rel_common_opt,
@@ -130,6 +131,8 @@ Result<DeclarationInfo> ProcessEmitProject(
   }
 }
 
+}  // namespace
+
 template <typename RelMessage>
 Result<DeclarationInfo> ProcessEmit(const RelMessage& rel,
                                     const DeclarationInfo& no_emit_declr,
@@ -153,6 +156,7 @@ Result<DeclarationInfo> ProcessEmit(const RelMessage& rel,
     return no_emit_declr;
   }
 }
+
 /// In the specialization, a single ProjectNode is being used to
 /// get the Acero relation with or without emit.
 template <>
@@ -162,6 +166,8 @@ Result<DeclarationInfo> ProcessEmit(const substrait::ProjectRel& rel,
   return ProcessEmitProject(rel.has_common() ? std::optional(rel.common()) : std::nullopt,
                             no_emit_declr, schema);
 }
+
+namespace {
 
 Result<DeclarationInfo> ProcessExtensionEmit(const DeclarationInfo& no_emit_declr,
                                              const std::vector<int>& emit_order) {
@@ -288,6 +294,8 @@ Status DiscoverFilesFromDir(const std::shared_ptr<fs::LocalFileSystem>& local_fs
 
   return Status::OK();
 }
+
+}  // namespace
 
 namespace internal {
 
@@ -798,21 +806,10 @@ Result<DeclarationInfo> FromProto(const substrait::Rel& rel, const ExtensionSet&
 
       std::vector<compute::SortKey> sort_keys;
       sort_keys.reserve(sort.sorts_size());
-      // Substrait allows null placement to differ for each field.  Acero expects it to
-      // be consistent across all fields.  So we grab the null placement from the first
-      // key and verify all other keys have the same null placement
-      std::optional<SortBehavior> sample_sort_behavior;
+      // Substrait allows null placement to differ for each field.
       for (const auto& sort : sort.sorts()) {
         ARROW_ASSIGN_OR_RAISE(SortBehavior sort_behavior,
                               SortBehavior::Make(sort.direction()));
-        if (sample_sort_behavior) {
-          if (sample_sort_behavior->null_placement != sort_behavior.null_placement) {
-            return Status::NotImplemented(
-                "substrait::SortRel with ordering with mixed null placement");
-          }
-        } else {
-          sample_sort_behavior = sort_behavior;
-        }
         if (sort.sort_kind_case() != substrait::SortField::SortKindCase::kDirection) {
           return Status::NotImplemented("substrait::SortRel with custom sort function");
         }
@@ -820,18 +817,17 @@ Result<DeclarationInfo> FromProto(const substrait::Rel& rel, const ExtensionSet&
                               FromProto(sort.expr(), ext_set, conversion_options));
         const FieldRef* field_ref = expr.field_ref();
         if (field_ref) {
-          sort_keys.push_back(compute::SortKey(*field_ref, sort_behavior.sort_order));
+          sort_keys.push_back(compute::SortKey(*field_ref, sort_behavior.sort_order,
+                                               sort_behavior.null_placement));
         } else {
           return Status::Invalid("Sort key expressions must be a direct reference.");
         }
       }
 
-      DCHECK(sample_sort_behavior.has_value());
       acero::Declaration sort_dec{
           "order_by",
           {input.declaration},
-          acero::OrderByNodeOptions(compute::Ordering(
-              std::move(sort_keys), sample_sort_behavior->null_placement))};
+          acero::OrderByNodeOptions(compute::Ordering(std::move(sort_keys)))};
 
       DeclarationInfo sort_declaration{std::move(sort_dec), input.output_schema};
       return ProcessEmit(sort, std::move(sort_declaration),
@@ -1100,8 +1096,6 @@ Result<std::unique_ptr<substrait::FilterRel>> FilterRelationConverter(
   return filter_rel;
 }
 
-}  // namespace
-
 Status SerializeAndCombineRelations(const acero::Declaration& declaration,
                                     ExtensionSet* ext_set,
                                     std::unique_ptr<substrait::Rel>* rel,
@@ -1140,6 +1134,8 @@ Status SerializeAndCombineRelations(const acero::Declaration& declaration,
 
   return Status::OK();
 }
+
+}  // namespace
 
 Result<std::unique_ptr<substrait::Rel>> ToProto(
     const acero::Declaration& declr, ExtensionSet* ext_set,

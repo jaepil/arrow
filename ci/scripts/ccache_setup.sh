@@ -19,8 +19,12 @@
 
 set -eux
 
-echo "ARROW_USE_CCACHE=ON" >> $GITHUB_ENV
-echo "CCACHE_COMPILERCHECK=content" >> $GITHUB_ENV
-echo "CCACHE_COMPRESS=1" >> $GITHUB_ENV
-echo "CCACHE_COMPRESSLEVEL=6" >> $GITHUB_ENV
-echo "CCACHE_MAXSIZE=1G" >> $GITHUB_ENV
+# See similar definitions in compose.yaml under the `x-ccache` key
+{
+  echo "ARROW_USE_CCACHE=ON"
+  echo "CCACHE_COMPILERCHECK=content"
+  echo "CCACHE_COMPRESS=1"
+  echo "CCACHE_COMPRESSLEVEL=6"
+  echo "CCACHE_MAXSIZE=1.5G"
+  echo "CCACHE_NOHASHDIR=1"
+} >> "$GITHUB_ENV"

@@ -747,6 +747,10 @@ class TableTest < Test::Unit::TestCase
           @file.path
         end
 
+        def teardown
+          GC.start # Ensure freeing Arrow::Table that refers @file.path.
+        end
+
         sub_test_case("save: auto detect") do
           test("arrow") do
             output = create_output(".arrow")
@@ -1521,10 +1525,10 @@ visible: false
                                       ["key2_right", [100, 20]],
                                       ["string", ["1-100", "2-20"]],
                                     ]),
-                    table1.join(table2,
-                                ["key1", "key2"],
-                                left_suffix: "_left",
-                                right_suffix: "_right"))
+                   table1.join(table2,
+                               ["key1", "key2"],
+                               left_suffix: "_left",
+                               right_suffix: "_right"))
     end
   end
 end

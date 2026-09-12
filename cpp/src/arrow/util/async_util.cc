@@ -18,11 +18,12 @@
 #include "arrow/util/async_util.h"
 
 #include "arrow/util/future.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/string.h"
 #include "arrow/util/tracing_internal.h"
 
 #include <condition_variable>
+#include <exception>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -316,15 +317,11 @@ class ThrottledAsyncTaskSchedulerImpl
 #endif
       queue_->Push(std::move(task));
       lk.unlock();
-      maybe_backoff->AddCallback(
-          [weak_self = std::weak_ptr<ThrottledAsyncTaskSchedulerImpl>(
-               shared_from_this())](const Status& st) {
-            if (st.ok()) {
-              if (auto self = weak_self.lock()) {
-                self->ContinueTasks();
-              }
-            }
-          });
+      maybe_backoff->AddCallback([weak_self = weak_from_this()](const Status& st) {
+        if (auto self = weak_self.lock(); self && st.ok()) {
+          self->ContinueTasks();
+        }
+      });
       return true;
     } else {
       lk.unlock();
@@ -350,8 +347,9 @@ class ThrottledAsyncTaskSchedulerImpl
          self = shared_from_this()]() mutable -> Result<Future<>> {
           ARROW_ASSIGN_OR_RAISE(Future<> inner_fut, (*inner_task)());
           if (!inner_fut.TryAddCallback([&] {
-                return [latched_cost, self = std::move(self)](const Status& st) -> void {
-                  if (st.ok()) {
+                return [latched_cost,
+                        weak_self = self->weak_from_this()](const Status& st) -> void {
+                  if (auto self = weak_self.lock(); self && st.ok()) {
                     self->throttle_->Release(latched_cost);
                     self->ContinueTasks();
                   }
@@ -360,6 +358,7 @@ class ThrottledAsyncTaskSchedulerImpl
             // If the task is already finished then don't run ContinueTasks
             // if we are already running it so we can avoid stack overflow
             self->throttle_->Release(latched_cost);
+            inner_task.reset();
             if (!in_continue) {
               self->ContinueTasks();
             }
@@ -377,8 +376,8 @@ class ThrottledAsyncTaskSchedulerImpl
       if (maybe_backoff) {
         lk.unlock();
         if (!maybe_backoff->TryAddCallback([&] {
-              return [self = shared_from_this()](const Status& st) {
-                if (st.ok()) {
+              return [weak_self = weak_from_this()](const Status& st) {
+                if (auto self = weak_self.lock(); self && st.ok()) {
                   self->ContinueTasks();
                 }
               };
@@ -468,7 +467,19 @@ Future<> AsyncTaskScheduler::Make(FnOnce<Status(AsyncTaskScheduler*)> initial_ta
   auto scope = START_SCOPED_SPAN_SV(span, "AsyncTaskScheduler::InitialTask"sv);
   auto scheduler = std::make_unique<AsyncTaskSchedulerImpl>(std::move(stop_token),
                                                             std::move(abort_callback));
-  Status initial_task_st = std::move(initial_task)(scheduler.get());
+  Status initial_task_st;
+  // GH-47642: We normally don't catch exceptions in Arrow C++ code, as the error
+  // reporting model uses the Status object instead. Usually, an uncaught exception
+  // will simply terminate the process, surfacing the programming error.
+  // However, an exception thrown from the initial task would result in a much
+  // harder to diagnose process hang.
+  try {
+    initial_task_st = std::move(initial_task)(scheduler.get());
+  } catch (const std::exception& e) {
+    initial_task_st = Status::UnknownError("Initial task threw an exception: ", e.what());
+  } catch (...) {
+    initial_task_st = Status::UnknownError("Initial task threw an unknown exception");
+  }
   scheduler->OnTaskFinished(std::move(initial_task_st));
   // Keep scheduler alive until finished
   return scheduler->OnFinished().Then([scheduler = std::move(scheduler)] {});

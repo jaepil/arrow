@@ -44,6 +44,10 @@ using internal::checked_cast;
 namespace ipc {
 namespace feather {
 
+// These tests intentionally exercise the deprecated Feather API, suppressing
+// the deprecation warnings for the whole file.
+ARROW_SUPPRESS_DEPRECATION_WARNING
+
 struct TestParam {
   TestParam(int arg_version,
             Compression::type arg_compression = Compression::UNCOMPRESSED)
@@ -319,6 +323,24 @@ TEST_P(TestFeather, SliceBooleanRoundTrip) {
   CheckSlices(batch);
 }
 
+TEST_P(TestFeather, SliceListRoundTrip) {
+  if (GetParam().version == kFeatherV1Version) {
+    GTEST_SKIP() << "Feather V1 does not support list types";
+  }
+  std::shared_ptr<RecordBatch> batch;
+  ASSERT_OK(ipc::test::MakeListRecordBatchSized(600, &batch));
+  CheckSlices(batch);
+}
+
+TEST_P(TestFeather, SliceListViewRoundTrip) {
+  if (GetParam().version == kFeatherV1Version) {
+    GTEST_SKIP() << "Feather V1 does not support list view types";
+  }
+  std::shared_ptr<RecordBatch> batch;
+  ASSERT_OK(ipc::test::MakeListViewRecordBatchSized(600, &batch));
+  CheckSlices(batch);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     FeatherTests, TestFeather,
     ::testing::Values(TestParam(kFeatherV1Version), TestParam(kFeatherV2Version),
@@ -364,6 +386,8 @@ TEST_P(TestFeatherRoundTrip, RoundTrip) {
 
 INSTANTIATE_TEST_SUITE_P(FeatherRoundTripTests, TestFeatherRoundTrip,
                          ::testing::ValuesIn(kBatchCases));
+
+ARROW_UNSUPPRESS_DEPRECATION_WARNING
 
 }  // namespace feather
 }  // namespace ipc

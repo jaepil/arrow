@@ -18,8 +18,7 @@
 ARG base
 FROM ${base}
 
-ARG r=4.4
-ARG jdk=11
+ARG r=4.5
 
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
@@ -32,11 +31,9 @@ RUN apt-get update -y && \
         lsb-release && \
     gpg --keyserver keyserver.ubuntu.com \
         --recv-key 95C0FAF38DB3CCAD0C080A7BDC78B2DDEABC47B7 && \
-    gpg --export 95C0FAF38DB3CCAD0C080A7BDC78B2DDEABC47B7 | \
-        gpg --no-default-keyring \
-            --keyring /usr/share/keyrings/cran.gpg \
-            --import - && \
-    echo "deb [signed-by=/usr/share/keyrings/cran.gpg] https://cloud.r-project.org/bin/linux/$(lsb_release -is | tr 'A-Z' 'a-z') $(lsb_release -cs)-cran40/" | \
+    gpg --armor --export 95C0FAF38DB3CCAD0C080A7BDC78B2DDEABC47B7 | \
+        tee /usr/share/keyrings/cran.asc && \
+    echo "deb [signed-by=/usr/share/keyrings/cran.asc] https://cloud.r-project.org/bin/linux/$(lsb_release -is | tr 'A-Z' 'a-z') $(lsb_release -cs)-cran40/" | \
         tee /etc/apt/sources.list.d/cran.list && \
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i \
@@ -67,7 +64,6 @@ RUN apt-get update -y && \
         nodejs \
         npm \
         nvidia-cuda-toolkit \
-        openjdk-${jdk}-jdk-headless \
         pandoc \
         r-recommended=${r}* \
         r-base=${r}* \
@@ -79,15 +75,6 @@ RUN apt-get update -y && \
     rm -rf /var/lib/apt/lists/* && \
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
        npm install -g yarn @mermaid-js/mermaid-cli
-
-ENV JAVA_HOME=/usr/lib/jvm/java-${jdk}-openjdk-amd64
-
-ARG maven=3.8.7
-COPY ci/scripts/util_download_apache.sh /arrow/ci/scripts/
-RUN /arrow/ci/scripts/util_download_apache.sh \
-    "maven/maven-3/${maven}/binaries/apache-maven-${maven}-bin.tar.gz" /opt
-ENV PATH=/opt/apache-maven-${maven}/bin:$PATH
-RUN mvn -version
 
 COPY c_glib/Gemfile /arrow/c_glib/
 RUN gem install --no-document bundler && \
@@ -133,4 +120,5 @@ ENV ARROW_ACERO=ON \
     ARROW_S3=ON \
     ARROW_USE_GLOG=OFF \
     CMAKE_UNITY_BUILD=ON \
+    CUDAToolkit_ROOT=/usr \
     RETICULATE_PYTHON_ENV=${ARROW_PYTHON_VENV}

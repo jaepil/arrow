@@ -14,19 +14,20 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 #include "parquet/level_conversion.h"
 
-#include <algorithm>
 #include <limits>
 #include <optional>
 
-#include "arrow/util/bit_run_reader.h"
-#include "arrow/util/bit_util.h"
 #include "arrow/util/cpu_info.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/macros.h"
 #include "parquet/exception.h"
 
-#include "parquet/level_comparison.h"
+#if defined(ARROW_HAVE_RUNTIME_BMI2)
+#  include "parquet/level_conversion_bmi2_internal.h"
+#endif
+
 #define PARQUET_IMPL_NAMESPACE standard
 #include "parquet/level_conversion_inc.h"
 #undef PARQUET_IMPL_NAMESPACE
@@ -114,21 +115,9 @@ void DefRepLevelsToListInfo(const int16_t* def_levels, const int16_t* rep_levels
   } else if (valid_bits_writer.has_value()) {
     output->values_read = valid_bits_writer->position();
   }
-  if (output->null_count > 0 && level_info.null_slot_usage > 1) {
-    throw ParquetException(
-        "Null values with null_slot_usage > 1 not supported."
-        "(i.e. FixedSizeLists with null values are not supported)");
-  }
 }
 
 }  // namespace
-
-#if defined(ARROW_HAVE_RUNTIME_BMI2)
-// defined in level_conversion_bmi2.cc for dynamic dispatch.
-void DefLevelsToBitmapBmi2WithRepeatedParent(const int16_t* def_levels,
-                                             int64_t num_def_levels, LevelInfo level_info,
-                                             ValidityBitmapInputOutput* output);
-#endif
 
 void DefLevelsToBitmap(const int16_t* def_levels, int64_t num_def_levels,
                        LevelInfo level_info, ValidityBitmapInputOutput* output) {

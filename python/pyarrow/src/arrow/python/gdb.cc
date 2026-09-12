@@ -17,18 +17,23 @@
 
 #include <cstdlib>
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "arrow/array.h"
+#include "arrow/array/builder_binary.h"
 #include "arrow/chunked_array.h"
 #include "arrow/datum.h"
 #include "arrow/extension/uuid.h"
-#include "arrow/ipc/json_simple.h"
+#include "arrow/json/from_string.h"
 #include "arrow/python/gdb.h"
 #include "arrow/record_batch.h"
 #include "arrow/scalar.h"
 #include "arrow/table.h"
 #include "arrow/type.h"
+#include "arrow/util/checked_cast.h"
 #include "arrow/util/debug.h"
 #include "arrow/util/decimal.h"
 #include "arrow/util/key_value_metadata.h"
@@ -39,9 +44,11 @@ namespace arrow {
 
 using extension::uuid;
 using extension::UuidType;
-using ipc::internal::json::ArrayFromJSON;
-using ipc::internal::json::ChunkedArrayFromJSON;
-using ipc::internal::json::ScalarFromJSON;
+using json::ArrayFromJSONString;
+using json::ChunkedArrayFromJSONString;
+using json::ScalarFromJSONString;
+
+using ::arrow::internal::checked_cast;
 
 namespace gdb {
 
@@ -61,12 +68,31 @@ class CustomStatusDetail : public StatusDetail {
 std::shared_ptr<Array> SliceArrayFromJSON(const std::shared_ptr<DataType>& ty,
                                           std::string_view json, int64_t offset = 0,
                                           int64_t length = -1) {
-  auto array = *ArrayFromJSON(ty, json);
+  auto array = *ArrayFromJSONString(ty, json);
   if (length != -1) {
     return array->Slice(offset, length);
   } else {
     return array->Slice(offset);
   }
+}
+
+template <typename BuilderType>
+std::shared_ptr<Array> BinaryArrayFromStrings(
+    const std::shared_ptr<DataType>& type,
+    const std::vector<std::optional<std::string>>& values) {
+  std::unique_ptr<ArrayBuilder> builder;
+  ARROW_CHECK_OK(MakeBuilder(default_memory_pool(), type, &builder));
+  auto& concrete_builder = checked_cast<BuilderType&>(*builder);
+  for (const auto& value : values) {
+    if (value.has_value()) {
+      ARROW_CHECK_OK(concrete_builder.Append(*value));
+    } else {
+      ARROW_CHECK_OK(concrete_builder.AppendNull());
+    }
+  }
+  std::shared_ptr<Array> array;
+  ARROW_CHECK_OK(concrete_builder.Finish(&array));
+  return array;
 }
 
 }  // namespace
@@ -119,6 +145,18 @@ void TestSession() {
       {"key_text", "key_binary"}, {"some value", std::string("z") + '\x00' + "\x1f\xff"});
 
   // Decimals
+  Decimal32 decimal32_zero{};
+  Decimal32 decimal32_pos{"987654321"};
+  Decimal32 decimal32_neg{"-987654321"};
+  BasicDecimal32 basic_decimal32_zero{};
+  BasicDecimal32 basic_decimal32_pos{decimal32_pos.value()};
+  BasicDecimal32 basic_decimal32_neg{decimal32_neg.value()};
+  Decimal64 decimal64_zero{};
+  Decimal64 decimal64_pos{"987654321098765432"};
+  Decimal64 decimal64_neg{"-987654321098765432"};
+  BasicDecimal64 basic_decimal64_zero{};
+  BasicDecimal64 basic_decimal64_pos{decimal64_pos.value()};
+  BasicDecimal64 basic_decimal64_neg{decimal64_neg.value()};
   Decimal128 decimal128_zero{};
   Decimal128 decimal128_pos{"98765432109876543210987654321098765432"};
   Decimal128 decimal128_neg{"-98765432109876543210987654321098765432"};
@@ -168,8 +206,12 @@ void TestSession() {
   FixedSizeBinaryType fixed_size_binary_type(10);
   auto heap_fixed_size_binary_type = fixed_size_binary(10);
 
+  Decimal32Type decimal32_type(8, 3);
+  Decimal64Type decimal64_type(16, 5);
   Decimal128Type decimal128_type(16, 5);
   Decimal256Type decimal256_type(42, 12);
+  auto heap_decimal32_type = decimal32(8, 3);
+  auto heap_decimal64_type = decimal64(16, 5);
   auto heap_decimal128_type = decimal128(16, 5);
 
   ListType list_type(uint8());
@@ -274,6 +316,17 @@ void TestSession() {
   Date64Scalar date64_scalar{45 * 86400000LL};
   Date64Scalar date64_scalar_null{};
 
+  Decimal32Scalar decimal32_scalar_pos{Decimal32("1234567"), decimal32(9, 4)};
+  Decimal32Scalar decimal32_scalar_neg{Decimal32("-1234567"), decimal32(9, 4)};
+  Decimal32Scalar decimal32_scalar_null{decimal32(9, 4)};
+  auto heap_decimal32_scalar = *MakeScalar(decimal32(9, 4), Decimal32("1234567"));
+
+  Decimal64Scalar decimal64_scalar_pos{Decimal64("12345678901234567"), decimal64(18, 4)};
+  Decimal64Scalar decimal64_scalar_neg{Decimal64("-12345678901234567"), decimal64(18, 4)};
+  Decimal64Scalar decimal64_scalar_null{decimal64(18, 4)};
+  auto heap_decimal64_scalar =
+      *MakeScalar(decimal64(18, 4), Decimal64("12345678901234567"));
+
   Decimal128Scalar decimal128_scalar_pos_scale_pos{Decimal128("1234567"),
                                                    decimal128(10, 4)};
   Decimal128Scalar decimal128_scalar_pos_scale_neg{Decimal128("-1234567"),
@@ -320,13 +373,13 @@ void TestSession() {
       Buffer::FromString("   "), fixed_size_binary(3), /*is_valid=*/false};
 
   std::shared_ptr<Array> dict_array;
-  dict_array = *ArrayFromJSON(utf8(), R"(["foo", "bar", "quux"])");
+  dict_array = *ArrayFromJSONString(utf8(), R"(["foo", "bar", "quux"])");
   DictionaryScalar dict_scalar{{std::make_shared<Int8Scalar>(42), dict_array},
                                dictionary(int8(), utf8())};
   DictionaryScalar dict_scalar_null{dictionary(int8(), utf8())};
 
-  std::shared_ptr<Array> list_value_array = *ArrayFromJSON(int32(), R"([4, 5, 6])");
-  std::shared_ptr<Array> list_zero_length = *ArrayFromJSON(int32(), R"([])");
+  std::shared_ptr<Array> list_value_array = *ArrayFromJSONString(int32(), R"([4, 5, 6])");
+  std::shared_ptr<Array> list_zero_length = *ArrayFromJSONString(int32(), R"([])");
   ListScalar list_scalar{list_value_array};
   ListScalar list_scalar_null{list_zero_length, list(int32()), /*is_valid=*/false};
   LargeListScalar large_list_scalar{list_value_array};
@@ -363,9 +416,8 @@ void TestSession() {
   ExtensionScalar extension_scalar_null{extension_scalar.value, extension_scalar_type,
                                         /*is_valid=*/false};
 
-  std::shared_ptr<Scalar> heap_map_scalar;
-  ARROW_CHECK_OK(
-      ScalarFromJSON(map(utf8(), int32()), R"([["a", 5], ["b", 6]])", &heap_map_scalar));
+  auto heap_map_scalar =
+      *ScalarFromJSONString(map(utf8(), int32()), R"([["a", 5], ["b", 6]])");
   auto heap_map_scalar_null = MakeNullScalar(heap_map_scalar->type);
 
   // Array and ArrayData
@@ -442,50 +494,56 @@ void TestSession() {
   auto heap_timestamp_array_ns = SliceArrayFromJSON(
       timestamp(TimeUnit::NANO), R"([null, "1900-02-28 12:34:56.987654321"])");
 
+  auto heap_decimal32_array =
+      SliceArrayFromJSON(decimal32(9, 4), R"([null, "-12345.6789", "12345.6789"])");
+  auto heap_decimal64_array = SliceArrayFromJSON(
+      decimal64(18, 4), R"([null, "-12345678901234.5678", "12345678901234.5678"])");
   auto heap_decimal128_array = SliceArrayFromJSON(
       decimal128(30, 6),
       R"([null, "-1234567890123456789.012345", "1234567890123456789.012345"])");
   auto heap_decimal256_array = SliceArrayFromJSON(
       decimal256(50, 6), R"([null, "-123456789012345678901234567890123456789.012345"])");
+  auto heap_decimal32_array_sliced = heap_decimal32_array->Slice(1, 1);
   auto heap_decimal128_array_sliced = heap_decimal128_array->Slice(1, 1);
 
-  auto heap_fixed_size_binary_array =
-      SliceArrayFromJSON(fixed_size_binary(3), "[null, \"abc\", \"\\u0000\\u001f\xff\"]");
+  auto heap_fixed_size_binary_array = BinaryArrayFromStrings<FixedSizeBinaryBuilder>(
+      fixed_size_binary(3), {std::nullopt, "abc", std::string("\x00\x1f\xff", 3)});
   auto heap_fixed_size_binary_array_zero_width =
       SliceArrayFromJSON(fixed_size_binary(0), R"([null, ""])");
   auto heap_fixed_size_binary_array_sliced = heap_fixed_size_binary_array->Slice(1, 1);
 
-  const char* json_binary_array = "[null, \"abcd\", \"\\u0000\\u001f\xff\"]";
-  auto heap_binary_array = SliceArrayFromJSON(binary(), json_binary_array);
-  auto heap_large_binary_array = SliceArrayFromJSON(large_binary(), json_binary_array);
-  const char* json_string_array = "[null, \"héhé\", \"invalid \xff char\"]";
-  auto heap_string_array = SliceArrayFromJSON(utf8(), json_string_array);
-  auto heap_large_string_array = SliceArrayFromJSON(large_utf8(), json_string_array);
+  const std::vector<std::optional<std::string>> binary_values = {
+      std::nullopt, "abcd", std::string("\x00\x1f\xff", 3)};
+  auto heap_binary_array = BinaryArrayFromStrings<BinaryBuilder>(binary(), binary_values);
+  auto heap_large_binary_array =
+      BinaryArrayFromStrings<LargeBinaryBuilder>(large_binary(), binary_values);
+  const std::vector<std::optional<std::string>> string_values = {std::nullopt, "héhé",
+                                                                 "invalid \xff char"};
+  auto heap_string_array = BinaryArrayFromStrings<StringBuilder>(utf8(), string_values);
+  auto heap_large_string_array =
+      BinaryArrayFromStrings<LargeStringBuilder>(large_utf8(), string_values);
   auto heap_binary_array_sliced = heap_binary_array->Slice(1, 1);
 
   // ChunkedArray
   ArrayVector array_chunks(2);
-  array_chunks[0] = *ArrayFromJSON(int32(), "[1, 2]");
-  array_chunks[1] = *ArrayFromJSON(int32(), "[3, null, 4]");
+  array_chunks[0] = *ArrayFromJSONString(int32(), "[1, 2]");
+  array_chunks[1] = *ArrayFromJSONString(int32(), "[3, null, 4]");
   ChunkedArray chunked_array{array_chunks};
 
   // RecordBatch
   auto batch_schema = schema({field("ints", int32()), field("strs", utf8())});
   ArrayVector batch_columns{2};
-  batch_columns[0] = *ArrayFromJSON(int32(), "[1, 2, 3]");
-  batch_columns[1] = *ArrayFromJSON(utf8(), R"(["abc", null, "def"])");
+  batch_columns[0] = *ArrayFromJSONString(int32(), "[1, 2, 3]");
+  batch_columns[1] = *ArrayFromJSONString(utf8(), R"(["abc", null, "def"])");
   auto batch = RecordBatch::Make(batch_schema, /*num_rows=*/3, batch_columns);
   auto batch_with_metadata = batch->ReplaceSchemaMetadata(
       key_value_metadata({"key1", "key2", "key3"}, {"value1", "value2", "value3"}));
 
   // Table
-  ChunkedArrayVector table_columns{2};
-  ARROW_CHECK_OK(
-      ChunkedArrayFromJSON(int32(), {"[1, 2, 3]", "[4, 5]"}, &table_columns[0]));
-  ARROW_CHECK_OK(ChunkedArrayFromJSON(
-      utf8(), {R"(["abc", null])", R"(["def"])", R"(["ghi", "jkl"])"},
-      &table_columns[1]));
-  auto table = Table::Make(batch_schema, table_columns);
+  auto col1 = ChunkedArrayFromJSONString(int32(), {"[1, 2, 3]", "[4, 5]"});
+  auto col2 = ChunkedArrayFromJSONString(
+      utf8(), {R"(["abc", null])", R"(["def"])", R"(["ghi", "jkl"])"});
+  auto table = Table::Make(batch_schema, {*col1, *col2});
 
   // Datum
   Datum empty_datum{};

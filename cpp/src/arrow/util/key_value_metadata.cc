@@ -29,8 +29,8 @@
 #include "arrow/result.h"
 #include "arrow/status.h"
 #include "arrow/util/key_value_metadata.h"
-#include "arrow/util/logging.h"
-#include "arrow/util/sort.h"
+#include "arrow/util/logging_internal.h"
+#include "arrow/util/sort_internal.h"
 
 using std::size_t;
 
@@ -100,6 +100,12 @@ Result<std::string> KeyValueMetadata::Get(std::string_view key) const {
 }
 
 Status KeyValueMetadata::Delete(int64_t index) {
+  if (ARROW_PREDICT_FALSE(index < 0 || index >= static_cast<int64_t>(keys_.size()))) {
+    return Status::IndexError("KeyValueMetadata::Delete: index ", index,
+                              " is out of bounds for metadata "
+                              "of size ",
+                              keys_.size());
+  }
   keys_.erase(keys_.begin() + index);
   values_.erase(values_.begin() + index);
   return Status::OK();

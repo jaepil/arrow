@@ -21,7 +21,7 @@
 #include "arrow/array/concatenate.h"
 #include "arrow/chunked_array.h"
 #include "arrow/compute/api_vector.h"
-#include "arrow/compute/kernels/test_util.h"
+#include "arrow/compute/kernels/test_util_internal.h"
 #include "arrow/testing/generator.h"
 #include "arrow/testing/gtest_util.h"
 #include "arrow/util/checked_cast.h"
@@ -199,6 +199,13 @@ class TestReplaceBoolean : public TestReplaceKernel<BooleanType> {
   }
 };
 
+class TestReplaceNull : public TestReplaceKernel<NullType> {
+ protected:
+  std::shared_ptr<DataType> type() override {
+    return TypeTraits<NullType>::type_singleton();
+  }
+};
+
 class TestReplaceFixedSizeBinary : public TestReplaceKernel<FixedSizeBinaryType> {
  protected:
   std::shared_ptr<DataType> type() override { return fixed_size_binary(3); }
@@ -233,8 +240,9 @@ class TestReplaceBinary : public TestReplaceKernel<T> {
 
 using NumericBasedTypes =
     ::testing::Types<UInt8Type, UInt16Type, UInt32Type, UInt64Type, Int8Type, Int16Type,
-                     Int32Type, Int64Type, FloatType, DoubleType, Date32Type, Date64Type,
-                     Time32Type, Time64Type, TimestampType, MonthIntervalType>;
+                     Int32Type, Int64Type, HalfFloatType, FloatType, DoubleType,
+                     Date32Type, Date64Type, Time32Type, Time64Type, TimestampType,
+                     MonthIntervalType>;
 
 TYPED_TEST_SUITE(TestReplaceNumeric, NumericBasedTypes);
 TYPED_TEST_SUITE(TestReplaceDecimal, DecimalArrowTypes);
@@ -529,6 +537,53 @@ TEST_F(TestReplaceBoolean, ReplaceWithMask) {
        this->scalar("true"), this->array("[false, null, true]")},
       {this->array("[null, null]"), this->mask("[true, true]"),
        this->array("[true, true]"), this->array("[true, true]")},
+  };
+
+  for (auto test_case : cases) {
+    this->Assert(ReplaceWithMask, test_case.input, test_case.mask, test_case.replacements,
+                 test_case.expected);
+  }
+}
+
+// Regression test: ReplaceMaskChunked (the ChunkedArray path of replace_with_mask)
+// sized each output chunk's data buffer via byte_width(), which is 0 for boolean
+// (bit-packed), the same GH-45086 buffer-overflow pattern fixed elsewhere in this
+// file. A chunk needs to be large enough to write past the buffer's small built-in
+// padding to reliably reproduce the crash.
+TEST_F(TestReplaceBoolean, ReplaceWithMaskChunkedArray) {
+  constexpr int64_t kChunkLength = 4096;
+  auto all_false = ConstantArrayGenerator::Boolean(kChunkLength, /*value=*/false);
+  auto all_true = ConstantArrayGenerator::Boolean(kChunkLength, /*value=*/true);
+  auto input = std::make_shared<ChunkedArray>(
+      ArrayVector{all_false, all_false, all_false}, boolean());
+  auto expected = std::make_shared<ChunkedArray>(
+      ArrayVector{all_true, all_true, all_true}, boolean());
+
+  this->Assert(ReplaceWithMask, Datum(input), this->mask_scalar(true),
+               this->scalar("true"), Datum(expected));
+}
+
+TEST_F(TestReplaceNull, ReplaceWithMask) {
+  std::vector<ReplaceWithMaskCase> cases = {
+      {this->array("[]"), this->mask_scalar(false), this->array("[]"), this->array("[]")},
+      {this->array("[]"), this->mask_scalar(true), this->array("[]"), this->array("[]")},
+      {this->array("[]"), this->null_mask_scalar(), this->array("[]"), this->array("[]")},
+
+      {this->array("[null]"), this->mask_scalar(false), this->array("[]"),
+       this->array("[null]")},
+
+      {this->array("[null]"), this->mask_scalar(true), this->array("[null]"),
+       this->array("[null]")},
+
+      {this->array("[null]"), this->null_mask_scalar(), this->array("[]"),
+       this->array("[null]")},
+
+      {this->array("[null, null]"), this->mask("[false, false]"), this->array("[]"),
+       this->array("[null, null]")},
+      {this->array("[null, null]"), this->mask("[true, true]"),
+       this->array("[null, null]"), this->array("[null, null]")},
+      {this->array("[null, null]"), this->mask("[null, null]"), this->array("[]"),
+       this->array("[null, null]")},
   };
 
   for (auto test_case : cases) {
@@ -1080,6 +1135,13 @@ class TestFillNullType : public TestReplaceKernel<NullType> {
   std::shared_ptr<DataType> type() override { return default_type_instance<NullType>(); }
 };
 
+class TestFillNullBoolean : public TestReplaceKernel<BooleanType> {
+ protected:
+  std::shared_ptr<DataType> type() override {
+    return TypeTraits<BooleanType>::type_singleton();
+  }
+};
+
 TYPED_TEST_SUITE(TestFillNullNumeric, NumericBasedTypes);
 TYPED_TEST_SUITE(TestFillNullDecimal, DecimalArrowTypes);
 TYPED_TEST_SUITE(TestFillNullBinary, BaseBinaryArrowTypes);
@@ -1490,6 +1552,7 @@ TYPED_TEST(TestFillNullNumeric, FillNullForwardLargeInput) {
   ASSERT_OK_AND_ASSIGN(auto array_null, MakeArrayOfNull(array_random->type(), len_null));
   auto array_null_filled =
       ConstantArrayGenerator::Numeric<TypeParam>(len_null, x_ptr[len_random - 1]);
+  ASSERT_NE(array_null_filled, nullptr);
   {
     ASSERT_OK_AND_ASSIGN(auto value_array,
                          Concatenate({array_random, array_null, array_random}));
@@ -2052,6 +2115,41 @@ TYPED_TEST(TestFillNullBinary, FillBackwardChunkedArray) {
                            R"(["qup"])", R"(["qup", "mnz"])"}),
       this->chunked_array({R"(["tre", "tre", "tre"])", R"(["qup", "qup", "qup"])",
                            R"(["qup"])", R"(["qup", "mnz"])"}));
+}
+
+// Regression test for GH-45086: FillNullForwardChunked/FillNullBackwardChunked
+// size each output chunk's data buffer as `type->byte_width() * chunk->length()`.
+// For BooleanType, byte_width() returns 0 (it is bit-packed, not byte-addressable),
+// so the buffer was allocated with 0 bytes while the chunk's declared length stayed
+// the same, and filling the chunk wrote past the end of the (near-)empty buffer.
+// The corruption/crash only reliably manifests once a chunk is large enough to
+// write past the buffer's small built-in padding, hence the large pad length here.
+TEST_F(TestFillNullBoolean, FillNullForwardChunkedArray) {
+  constexpr int64_t kPadLength = 4096;
+  ASSERT_OK_AND_ASSIGN(auto null_pad, MakeArrayOfNull(boolean(), kPadLength));
+  auto all_true = ConstantArrayGenerator::Boolean(kPadLength, /*value=*/true);
+  auto single_true = ConstantArrayGenerator::Boolean(1, /*value=*/true);
+
+  auto input = std::make_shared<ChunkedArray>(
+      ArrayVector{null_pad, single_true, null_pad}, boolean());
+  auto expected = std::make_shared<ChunkedArray>(
+      ArrayVector{null_pad, single_true, all_true}, boolean());
+
+  this->AssertFillNullChunkedArray(FillNullForward, input, expected);
+}
+
+TEST_F(TestFillNullBoolean, FillNullBackwardChunkedArray) {
+  constexpr int64_t kPadLength = 4096;
+  ASSERT_OK_AND_ASSIGN(auto null_pad, MakeArrayOfNull(boolean(), kPadLength));
+  auto all_true = ConstantArrayGenerator::Boolean(kPadLength, /*value=*/true);
+  auto single_true = ConstantArrayGenerator::Boolean(1, /*value=*/true);
+
+  auto input = std::make_shared<ChunkedArray>(
+      ArrayVector{null_pad, single_true, null_pad}, boolean());
+  auto expected = std::make_shared<ChunkedArray>(
+      ArrayVector{all_true, single_true, null_pad}, boolean());
+
+  this->AssertFillNullChunkedArray(FillNullBackward, input, expected);
 }
 
 TEST_F(TestFillNullType, TestFillOnNullType) {

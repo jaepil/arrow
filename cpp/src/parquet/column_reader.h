@@ -22,6 +22,8 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/type_fwd.h"
+#include "arrow/util/macros.h"
 #include "parquet/exception.h"
 #include "parquet/level_conversion.h"
 #include "parquet/metadata.h"
@@ -29,21 +31,6 @@
 #include "parquet/properties.h"
 #include "parquet/schema.h"
 #include "parquet/types.h"
-
-namespace arrow {
-
-class Array;
-class ChunkedArray;
-
-namespace bit_util {
-class BitReader;
-}  // namespace bit_util
-
-namespace util {
-class RleDecoder;
-}  // namespace util
-
-}  // namespace arrow
 
 namespace parquet {
 
@@ -78,44 +65,58 @@ struct PARQUET_EXPORT DataPageStats {
 
 class PARQUET_EXPORT LevelDecoder {
  public:
-  LevelDecoder();
+  explicit LevelDecoder(int16_t max_level = 0);
+
   ~LevelDecoder();
 
-  // Initialize the LevelDecoder state with new data
-  // and return the number of bytes consumed
+  /// Initialize the LevelDecoder state with new data from a legacy (V1) page.
+  ///
+  /// @return the number of bytes consumed
   int SetData(Encoding::type encoding, int16_t max_level, int num_buffered_values,
               const uint8_t* data, int32_t data_size);
 
+  /// Initialize the LevelDecoder state with new data from a V2 page.
+  ///
+  /// Repetition and definition levels in V2 pages are always RLE encoded.
   void SetDataV2(int32_t num_bytes, int16_t max_level, int num_buffered_values,
                  const uint8_t* data);
 
-  // Decodes a batch of levels into an array and returns the number of levels decoded
+  /// Decode a batch of levels into an array and returns the number of levels decoded.
   int Decode(int batch_size, int16_t* levels);
 
+  /// Advance the decoder and throw away decoder levels.
+  int Skip(int batch_size);
+
+  struct CountUpToResult {
+    int matching_count;
+    int processed_count;
+  };
+
+  /// Advance and count the number of occurrences of `value`.
+  ///
+  /// The count is limited to at most the next `batch_size` items.
+  /// @return The matching value count and number of elements that were processed.
+  CountUpToResult CountUpTo(int16_t value, int batch_size);
+
+  /// Return the max level used in this decoder.
+  int max_level() const { return max_level_; }
+
  private:
-  int bit_width_;
-  int num_values_remaining_;
-  Encoding::type encoding_;
-  std::unique_ptr<::arrow::util::RleDecoder> rle_decoder_;
-  std::unique_ptr<::arrow::bit_util::BitReader> bit_packed_decoder_;
+  struct Impl;
+
+  std::unique_ptr<Impl> impl_;
+  /// Number of value remaining. The underlying decoder zero pads bit packed values
+  /// up to a multiple of 8 so it cannot know the exact number of remaining values.
+  int num_values_remaining_ = 0;
   int16_t max_level_;
 };
 
 struct CryptoContext {
-  CryptoContext(bool start_with_dictionary_page, int16_t rg_ordinal, int16_t col_ordinal,
-                std::shared_ptr<Decryptor> meta, std::shared_ptr<Decryptor> data)
-      : start_decrypt_with_dictionary_page(start_with_dictionary_page),
-        row_group_ordinal(rg_ordinal),
-        column_ordinal(col_ordinal),
-        meta_decryptor(std::move(meta)),
-        data_decryptor(std::move(data)) {}
-  CryptoContext() {}
-
   bool start_decrypt_with_dictionary_page = false;
   int16_t row_group_ordinal = -1;
   int16_t column_ordinal = -1;
-  std::shared_ptr<Decryptor> meta_decryptor;
-  std::shared_ptr<Decryptor> data_decryptor;
+  std::function<std::unique_ptr<Decryptor>()> meta_decryptor_factory;
+  std::function<std::unique_ptr<Decryptor>()> data_decryptor_factory;
 };
 
 // Abstract page iterator interface. This way, we can feed column pages to the
@@ -126,11 +127,21 @@ class PARQUET_EXPORT PageReader {
  public:
   virtual ~PageReader() = default;
 
+  static std::unique_ptr<PageReader> Open(std::shared_ptr<ArrowInputStream> stream,
+                                          int64_t total_num_values,
+                                          Compression::type codec,
+                                          const ReaderProperties& properties,
+                                          const ColumnDescriptor& descr,
+                                          bool always_compressed = false,
+                                          const CryptoContext* ctx = NULLPTR);
+
+  PARQUET_DEPRECATED("Deprecated in 25.0.0. Use the ColumnDescriptor overload instead.")
   static std::unique_ptr<PageReader> Open(
       std::shared_ptr<ArrowInputStream> stream, int64_t total_num_values,
       Compression::type codec, bool always_compressed = false,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
       const CryptoContext* ctx = NULLPTR);
+  PARQUET_DEPRECATED("Deprecated in 25.0.0. Use the ColumnDescriptor overload instead.")
   static std::unique_ptr<PageReader> Open(std::shared_ptr<ArrowInputStream> stream,
                                           int64_t total_num_values,
                                           Compression::type codec,
@@ -276,10 +287,13 @@ class PARQUET_EXPORT RecordReader {
   /// @param read_dictionary True if reading directly as Arrow dictionary-encoded
   /// @param read_dense_for_nullable True if reading dense and not leaving space for null
   /// values
+  /// @param arrow_type Which type to read this column as (optional). Currently
+  /// only used for byte array columns (see BinaryRecordReader::GetBuilderChunks).
   static std::shared_ptr<RecordReader> Make(
       const ColumnDescriptor* descr, LevelInfo leaf_info,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
-      bool read_dictionary = false, bool read_dense_for_nullable = false);
+      bool read_dictionary = false, bool read_dense_for_nullable = false,
+      const std::shared_ptr<::arrow::DataType>& arrow_type = NULLPTR);
 
   virtual ~RecordReader() = default;
 
@@ -394,8 +408,8 @@ class PARQUET_EXPORT RecordReader {
   /// call. No extra values are buffered for the next call. SkipRecords will not
   /// add any value to this buffer.
   std::shared_ptr<::arrow::ResizableBuffer> values_;
-  /// \brief False for BYTE_ARRAY, in which case we don't allocate the values
-  /// buffer and we directly read into builder classes.
+  /// \brief False for FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY, in which case we
+  /// don't allocate the values buffer and we directly read into builder classes.
   bool uses_values_;
 
   /// \brief Values that we have read into 'values_' + 'null_count_'.

@@ -45,7 +45,7 @@
 #include "arrow/util/async_generator.h"
 #include "arrow/util/future.h"
 #include "arrow/util/iterator.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/util/macros.h"
 #include "arrow/util/task_group.h"
 #include "arrow/util/thread_pool.h"
@@ -126,12 +126,12 @@ class CSVBufferIterator {
     }
 
     trailing_cr_ = (buf->data()[buf->size() - 1] == '\r');
-    buf = SliceBuffer(buf, offset);
+    buf = SliceBuffer(std::move(buf), offset);
     if (buf->size() == 0) {
       // EOF
       return TransformFinish();
     } else {
-      return TransformYield(buf);
+      return TransformYield(std::move(buf));
     }
   }
 
@@ -622,7 +622,9 @@ class ReaderMixin {
         column_names_ = GenerateColumnNames(parser.num_cols());
       } else {
         // Read column names from header row
-        auto visit = [&](const uint8_t* data, uint32_t size, bool quoted) -> Status {
+        auto visit = [&](const uint8_t* data, uint32_t size, bool quoted,
+                         bool missing) -> Status {
+          DCHECK(!missing);
           column_names_.emplace_back(reinterpret_cast<const char*>(data), size);
           return Status::OK();
         };
@@ -674,8 +676,14 @@ class ReaderMixin {
       // Does the named column have a fixed type?
       auto it = convert_options_.column_types.find(col_name);
       if (it == convert_options_.column_types.end()) {
-        conversion_schema_.columns.push_back(
-            ConversionSchema::InferredColumn(std::move(col_name), col_index));
+        // If not explicitly typed, respect default_column_type when provided
+        if (convert_options_.default_column_type != nullptr) {
+          conversion_schema_.columns.push_back(ConversionSchema::TypedColumn(
+              std::move(col_name), col_index, convert_options_.default_column_type));
+        } else {
+          conversion_schema_.columns.push_back(
+              ConversionSchema::InferredColumn(std::move(col_name), col_index));
+        }
       } else {
         conversion_schema_.columns.push_back(
             ConversionSchema::TypedColumn(std::move(col_name), col_index, it->second));
@@ -769,6 +777,10 @@ class BaseTableReader : public ReaderMixin, public csv::TableReader {
  protected:
   // Make column builders from conversion schema
   Status MakeColumnBuilders() {
+    // This is making a single copy of ConvertOptions, which is reasonable even if
+    // it holds a slightly large container, rather than a distinct copy for each
+    // ColumnBuilder.
+    auto owned_options = std::make_shared<ConvertOptions>(convert_options_);
     for (const auto& column : conversion_schema_.columns) {
       std::shared_ptr<ColumnBuilder> builder;
       if (column.is_missing) {
@@ -777,11 +789,11 @@ class BaseTableReader : public ReaderMixin, public csv::TableReader {
       } else if (column.type != nullptr) {
         ARROW_ASSIGN_OR_RAISE(
             builder, ColumnBuilder::Make(io_context_.pool(), column.type, column.index,
-                                         convert_options_, task_group_));
+                                         owned_options, task_group_));
       } else {
-        ARROW_ASSIGN_OR_RAISE(builder,
-                              ColumnBuilder::Make(io_context_.pool(), column.index,
-                                                  convert_options_, task_group_));
+        ARROW_ASSIGN_OR_RAISE(
+            builder, ColumnBuilder::Make(io_context_.pool(), column.index, owned_options,
+                                         task_group_));
       }
       column_builders_.push_back(std::move(builder));
     }
@@ -1021,13 +1033,9 @@ class AsyncThreadedTableReader
                         convert_options, /*count_rows=*/false),
         cpu_executor_(cpu_executor) {}
 
-  ~AsyncThreadedTableReader() override {
-    if (task_group_) {
-      // In case of error, make sure all pending tasks are finished before
-      // we start destroying BaseTableReader members
-      ARROW_UNUSED(task_group_->Finish());
-    }
-  }
+  // XXX Ideally we can create a child StopToken for the tasks spawned here, and
+  // request cancellation in our destructor, to avoid running superfluous tasks
+  // in case of early error.
 
   Status Init() override {
     ARROW_ASSIGN_OR_RAISE(auto istream_it,
@@ -1048,6 +1056,8 @@ class AsyncThreadedTableReader
   Result<std::shared_ptr<Table>> Read() override { return ReadAsync().result(); }
 
   Future<std::shared_ptr<Table>> ReadAsync() override {
+    // Note that this task group doesn't survive our destruction, so it's essential
+    // that async callbacks own a strong ref to us.
     task_group_ = TaskGroup::MakeThreaded(cpu_executor_, io_context_.stop_token());
 
     auto self = shared_from_this();

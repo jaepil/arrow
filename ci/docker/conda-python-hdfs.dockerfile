@@ -16,17 +16,18 @@
 # under the License.
 
 ARG repo
-ARG arch=amd64
-ARG python=3.9
-FROM ${repo}:${arch}-conda-python-${python}
+ARG arch
+ARG arch_short
+ARG python=3.11
+FROM --platform=linux/${arch} ${repo}:${arch_short}-conda-python-${python}
 
 ARG jdk=11
-ARG maven=3.8.7
+ARG maven=3.9.9
 RUN mamba install -q -y \
         maven=${maven} \
         openjdk=${jdk} \
         pandas && \
-    mamba clean --all
+    mamba clean --all --yes
 
 # installing libhdfs (JNI)
 ARG hdfs=3.2.1

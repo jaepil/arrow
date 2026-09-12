@@ -47,7 +47,7 @@ pushd "${ARROW_SITE_DIR}"
 source "${SOURCE_DIR}/git-vars.sh"
 git fetch --all --prune --tags --force -j$(nproc)
 git checkout ${DEFAULT_BRANCH}
-git rebase apache/${DEFAULT_BRANCH}
+git rebase upstream/${DEFAULT_BRANCH}
 git branch -D ${branch_name} || :
 git checkout -b ${branch_name}
 popd
@@ -95,6 +95,7 @@ cat <<ANNOUNCE > "${announce_file}"
 ---
 layout: default
 title: Apache Arrow ${version} Release
+date: "${release_date_iso8601}"
 permalink: /release/${version}.html
 ---
 <!--
@@ -274,7 +275,6 @@ current:
   mirrors: 'https://www.apache.org/dyn/closer.lua/arrow/arrow-${version}/'
   tarball-name: 'apache-arrow-${version}.tar.gz'
   tarball-url: 'https://www.apache.org/dyn/closer.lua?action=download&filename=arrow/arrow-${version}/apache-arrow-${version}.tar.gz'
-  java-artifacts: 'https://search.maven.org/#search%7Cga%7C1%7Cg%3A%22org.apache.arrow%22%20AND%20v%3A%22${version}%22'
   asc: '${apache_download_url}/arrow/arrow-${version}/apache-arrow-${version}.tar.gz.asc'
   sha256: '${apache_download_url}/arrow/arrow-${version}/apache-arrow-${version}.tar.gz.sha256'
   sha512: '${apache_download_url}/arrow/arrow-${version}/apache-arrow-${version}.tar.gz.sha512'

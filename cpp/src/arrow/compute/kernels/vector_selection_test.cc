@@ -27,7 +27,7 @@
 #include "arrow/array/concatenate.h"
 #include "arrow/chunked_array.h"
 #include "arrow/compute/api.h"
-#include "arrow/compute/kernels/test_util.h"
+#include "arrow/compute/kernels/test_util_internal.h"
 #include "arrow/scalar.h"
 #include "arrow/table.h"
 #include "arrow/testing/builder.h"
@@ -1704,6 +1704,29 @@ TEST_F(TestTakeKernelFSB, TakeFixedSizeBinary) {
   ASSERT_RAISES(IndexError, TakeCAC(type, {kABC, kABC}, "[0, 9, 0]").Value(&chunked_arr));
   ASSERT_RAISES(IndexError,
                 TakeCAC(type, {kABNullDE, kABC}, "[4, 10]").Value(&chunked_arr));
+}
+
+// GH-50840: taking more data than a 32-bit offset can address must raise
+// instead of silently overflowing the offsets buffer.
+TEST_F(TestTakeKernel, LARGE_MEMORY_TEST(TakeBinaryOffsetOverflow)) {
+  // 2048 * 1 MiB = 2 GiB of output, one value past the int32 offset limit.
+  constexpr int64_t kValueSize = 1 << 20;
+  constexpr int64_t kNumIndices = 2048;
+
+  StringBuilder values_builder;
+  ASSERT_OK(values_builder.Append(std::string(kValueSize, 'x')));
+  ASSERT_OK_AND_ASSIGN(auto values, values_builder.Finish());
+
+  Int32Builder indices_builder;
+  ASSERT_OK(indices_builder.Reserve(kNumIndices));
+  for (int64_t i = 0; i < kNumIndices; ++i) {
+    indices_builder.UnsafeAppend(0);
+  }
+  ASSERT_OK_AND_ASSIGN(auto indices, indices_builder.Finish());
+
+  EXPECT_RAISES_WITH_MESSAGE_THAT(
+      Invalid, ::testing::HasSubstr("Take operation overflowed binary array capacity"),
+      TakeAAA(*values, *indices));
 }
 
 using ListAndListViewArrowTypes =

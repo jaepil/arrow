@@ -22,38 +22,23 @@ ARG arch
 ARG arch_short
 ARG manylinux
 
-ENV MANYLINUX_VERSION=${manylinux}
-
-# Ensure dnf is installed, especially for the manylinux2014 base
-RUN if [ "${MANYLINUX_VERSION}" = "2014" ]; then \
-      sed -i \
-        -e 's/^mirrorlist/#mirrorlist/' \
-        -e 's/^#baseurl/baseurl/' \
-        -e 's/mirror\.centos\.org/vault.centos.org/' \
-        /etc/yum.repos.d/*.repo; \
-      if [ "${arch}" != "amd64" ]; then \
-        sed -i \
-          -e 's,vault\.centos\.org/centos,vault.centos.org/altarch,' \
-          /etc/yum.repos.d/CentOS-SCLo-scl-rh.repo; \
-      fi; \
-    fi
-RUN yum install -y dnf
+ENV LINUX_WHEEL_KIND='manylinux'
+ENV LINUX_WHEEL_VERSION=${manylinux}
 
 # Install basic dependencies
-RUN dnf install -y git flex curl autoconf zip perl-IPC-Cmd wget
+RUN dnf install -y git flex curl autoconf zip perl-IPC-Cmd perl-Time-Piece wget
 
-# A system Python is required for ninja and vcpkg in this Dockerfile.
-# On manylinux2014 base images, system Python is 2.7.5, while
-# on manylinux_2_28, no system python is installed.
-# We therefore override the PATH with Python 3.8 in /opt/python
+# A system Python is required for Ninja and vcpkg in this Dockerfile.
+# On manylinux_2_28 base images, no system Python is installed.
+# We therefore override the PATH with Python 3.11 in /opt/python
 # so that we have a consistent Python version across base images.
-ENV CPYTHON_VERSION=cp39
+ENV CPYTHON_VERSION=cp311
 ENV PATH=/opt/python/${CPYTHON_VERSION}-${CPYTHON_VERSION}/bin:${PATH}
 
 # Install CMake
 ARG cmake=3.29.2
 COPY ci/scripts/install_cmake.sh arrow/ci/scripts/
-RUN /arrow/ci/scripts/install_cmake.sh ${arch} linux ${cmake} /usr/local
+RUN /arrow/ci/scripts/install_cmake.sh ${cmake} /usr/local
 
 # Install Ninja
 ARG ninja=1.10.2
@@ -61,9 +46,18 @@ COPY ci/scripts/install_ninja.sh arrow/ci/scripts/
 RUN /arrow/ci/scripts/install_ninja.sh ${ninja} /usr/local
 
 # Install ccache
-ARG ccache=4.1
+ARG ccache=4.13.6
 COPY ci/scripts/install_ccache.sh arrow/ci/scripts/
 RUN /arrow/ci/scripts/install_ccache.sh ${ccache} /usr/local
+
+# Install sccache
+COPY ci/scripts/install_sccache.sh /arrow/ci/scripts/
+RUN /arrow/ci/scripts/install_sccache.sh unknown-linux-musl /usr/local/bin
+
+# Install bison (> 3.7 required for building thrift)
+ARG bison=3.7.6
+COPY ci/scripts/install_bison.sh arrow/ci/scripts/
+RUN /arrow/ci/scripts/install_bison.sh ${bison} /usr/local
 
 # Install vcpkg
 ARG vcpkg
@@ -107,16 +101,20 @@ RUN --mount=type=secret,id=github_repository_owner \
         --x-feature=flight \
         --x-feature=gcs \
         --x-feature=json \
+        --x-feature=opentelemetry \
+        --x-feature=orc \
         --x-feature=parquet \
         --x-feature=s3 && \
       rm -rf ~/.config/NuGet/
 
 # Make sure auditwheel is up-to-date
-RUN pipx upgrade auditwheel
+# Force upgrade version to 6.4.0 or later to ensure platform tags order is correct
+# See https://github.com/apache/arrow/pull/46705
+RUN pipx upgrade auditwheel>=6.4.0
 
 # Configure Python for applications running in the bash shell of this Dockerfile
-ARG python=3.9
-ARG python_abi_tag=cp39
+ARG python=3.11
+ARG python_abi_tag=cp311
 ENV PYTHON_VERSION=${python}
 ENV PYTHON_ABI_TAG=${python_abi_tag}
 RUN PYTHON_ROOT=$(find /opt/python -name cp${PYTHON_VERSION/./}-${PYTHON_ABI_TAG}) && \
@@ -124,11 +122,6 @@ RUN PYTHON_ROOT=$(find /opt/python -name cp${PYTHON_VERSION/./}-${PYTHON_ABI_TAG
 
 SHELL ["/bin/bash", "-i", "-c"]
 ENTRYPOINT ["/bin/bash", "-i", "-c"]
-
-# Remove once there are released Cython wheels for 3.13 free-threaded available
-RUN if [ "${python_abi_tag}" = "cp313t" ]; then \
-      pip install cython --pre --extra-index-url "https://pypi.anaconda.org/scientific-python-nightly-wheels/simple" --prefer-binary ; \
-    fi
 
 COPY python/requirements-wheel-build.txt /arrow/python/
 RUN pip install -r /arrow/python/requirements-wheel-build.txt

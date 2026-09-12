@@ -29,7 +29,7 @@
 #include "arrow/builder.h"
 #include "arrow/scalar.h"
 #include "arrow/status.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 #include "arrow/visit_type_inline.h"
 
 namespace arrow {
@@ -64,24 +64,6 @@ Status ArrayBuilder::TrimBuffer(const int64_t bytes_filled, ResizableBuffer* buf
     // Null buffers are allowed in place of 0-byte buffers
     DCHECK_EQ(bytes_filled, 0);
   }
-  return Status::OK();
-}
-
-Status ArrayBuilder::AppendToBitmap(bool is_valid) {
-  RETURN_NOT_OK(Reserve(1));
-  UnsafeAppendToBitmap(is_valid);
-  return Status::OK();
-}
-
-Status ArrayBuilder::AppendToBitmap(const uint8_t* valid_bytes, int64_t length) {
-  RETURN_NOT_OK(Reserve(length));
-  UnsafeAppendToBitmap(valid_bytes, length);
-  return Status::OK();
-}
-
-Status ArrayBuilder::AppendToBitmap(int64_t num_bits, bool value) {
-  RETURN_NOT_OK(Reserve(num_bits));
-  UnsafeAppendToBitmap(num_bits, value);
   return Status::OK();
 }
 

@@ -90,11 +90,9 @@ class ARROW_EXPORT RecordBatch {
   /// in the resulting struct array.
   Result<std::shared_ptr<StructArray>> ToStructArray() const;
 
-  /// \brief Convert record batch with one data type to Tensor
+  /// \brief Convert RecordBatch to Tensor
   ///
-  /// Create a Tensor object with shape (number of rows, number of columns) and
-  /// strides (type size in bytes, type size in bytes * number of rows).
-  /// Generated Tensor will have column-major layout.
+  /// Create a Tensor object.
   ///
   /// \param[in] null_to_nan if true, convert nulls to NaN
   /// \param[in] row_major if true, create row-major Tensor else column-major Tensor
@@ -118,22 +116,39 @@ class ARROW_EXPORT RecordBatch {
   static Result<std::shared_ptr<RecordBatch>> FromStructArray(
       const std::shared_ptr<Array>& array, MemoryPool* pool = default_memory_pool());
 
-  /// \brief Determine if two record batches are exactly equal
+  /// \brief Determine if two record batches are equal
   ///
   /// \param[in] other the RecordBatch to compare with
-  /// \param[in] check_metadata if true, check that Schema metadata is the same
+  /// \param[in] check_metadata if true, the schema metadata will be compared,
+  ///            regardless of the value set in \ref EqualOptions::use_metadata
   /// \param[in] opts the options for equality comparisons
   /// \return true if batches are equal
   bool Equals(const RecordBatch& other, bool check_metadata = false,
               const EqualOptions& opts = EqualOptions::Defaults()) const;
 
+  /// \brief Determine if two record batches are equal
+  ///
+  /// \param[in] other the RecordBatch to compare with
+  /// \param[in] opts the options for equality comparisons
+  /// \return true if batches are equal
+  bool Equals(const RecordBatch& other, const EqualOptions& opts) const;
+
   /// \brief Determine if two record batches are approximately equal
+  ///
+  /// If the absolute tolerance (atol) is not specified in \ref arrow::EqualOptions,
+  /// 'arrow::kDefaultAbsoluteTolerance' is used.
   ///
   /// \param[in] other the RecordBatch to compare with
   /// \param[in] opts the options for equality comparisons
   /// \return true if batches are approximately equal
   bool ApproxEquals(const RecordBatch& other,
-                    const EqualOptions& opts = EqualOptions::Defaults()) const;
+                    const EqualOptions& opts = EqualOptions::Defaults()) const {
+    auto resolved_options = opts.use_schema(false);
+    if (!resolved_options.atol()) {
+      resolved_options = resolved_options.atol(kDefaultAbsoluteTolerance);
+    }
+    return Equals(other, resolved_options);
+  }
 
   /// \return the record batch's schema
   const std::shared_ptr<Schema>& schema() const { return schema_; }
@@ -286,7 +301,7 @@ class ARROW_EXPORT RecordBatch {
   ///
   /// The created array follows the C data interface statistics
   /// specification. See
-  /// https://arrow.apache.org/docs/format/CDataInterfaceStatistics.html
+  /// https://arrow.apache.org/docs/format/StatisticsSchema.html
   /// for details.
   ///
   /// \param[in] pool the memory pool to allocate memory from
@@ -295,7 +310,7 @@ class ARROW_EXPORT RecordBatch {
       MemoryPool* pool = default_memory_pool()) const;
 
  protected:
-  RecordBatch(const std::shared_ptr<Schema>& schema, int64_t num_rows);
+  RecordBatch(std::shared_ptr<Schema> schema, int64_t num_rows);
 
   std::shared_ptr<Schema> schema_;
   int64_t num_rows_;
@@ -371,8 +386,8 @@ class ARROW_EXPORT RecordBatchReader {
     using iterator_category = std::input_iterator_tag;
     using difference_type = std::ptrdiff_t;
     using value_type = std::shared_ptr<RecordBatch>;
-    using pointer = value_type const*;
-    using reference = value_type const&;
+    using pointer = const value_type*;
+    using reference = const value_type&;
 
     RecordBatchReaderIterator() : batch_(RecordBatchEnd()), reader_(NULLPTR) {}
 
@@ -390,7 +405,7 @@ class ARROW_EXPORT RecordBatchReader {
     }
 
     Result<std::shared_ptr<RecordBatch>> operator*() {
-      ARROW_RETURN_NOT_OK(batch_.status());
+      ARROW_RETURN_NOT_OK(batch_);
 
       return batch_;
     }

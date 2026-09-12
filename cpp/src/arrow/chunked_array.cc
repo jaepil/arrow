@@ -33,7 +33,7 @@
 #include "arrow/type.h"
 #include "arrow/type_traits.h"
 #include "arrow/util/checked_cast.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
@@ -62,6 +62,14 @@ ChunkedArray::ChunkedArray(ArrayVector chunks, std::shared_ptr<DataType> type)
   }
 }
 
+int64_t ChunkedArray::ComputeLogicalNullCount() const {
+  int64_t count = 0;
+  for (const auto& chunk : chunks_) {
+    count += chunk->ComputeLogicalNullCount();
+  }
+  return count;
+}
+
 Result<std::shared_ptr<ChunkedArray>> ChunkedArray::Make(ArrayVector chunks,
                                                          std::shared_ptr<DataType> type) {
   if (type == nullptr) {
@@ -83,7 +91,7 @@ Result<std::shared_ptr<ChunkedArray>> ChunkedArray::Make(ArrayVector chunks,
 Result<std::shared_ptr<ChunkedArray>> ChunkedArray::MakeEmpty(
     std::shared_ptr<DataType> type, MemoryPool* memory_pool) {
   std::vector<std::shared_ptr<Array>> new_chunks(1);
-  ARROW_ASSIGN_OR_RAISE(new_chunks[0], MakeEmptyArray(type, memory_pool));
+  ARROW_ASSIGN_OR_RAISE(new_chunks[0], MakeEmptyArray(std::move(type), memory_pool));
   return std::make_shared<ChunkedArray>(std::move(new_chunks));
 }
 
@@ -98,8 +106,34 @@ DeviceAllocationTypeSet ChunkedArray::device_types() const {
   }
   return set;
 }
+namespace {
+
+// Check whether the type or any of its children is a float type.
+bool ContainsFloatType(const DataType& type) {
+  if (is_floating(type.id())) {
+    return true;
+  } else {
+    // Check if any nested field contains a float type.
+    for (const auto& field : type.fields()) {
+      if (ContainsFloatType(*field->type())) {
+        return true;
+      }
+    }
+  }
+  // No float types are observed
+  return false;
+}
+
+}  //  namespace
 
 bool ChunkedArray::Equals(const ChunkedArray& other, const EqualOptions& opts) const {
+  if (this == &other) {
+    if (opts.nans_equal()) {
+      return true;
+    } else if (!ContainsFloatType(*type_)) {
+      return true;
+    }
+  }
   if (length_ != other.length()) {
     return false;
   }
@@ -125,59 +159,21 @@ bool ChunkedArray::Equals(const ChunkedArray& other, const EqualOptions& opts) c
       .ok();
 }
 
-namespace {
-
-bool mayHaveNaN(const arrow::DataType& type) {
-  if (type.num_fields() == 0) {
-    return is_floating(type.id());
-  } else {
-    for (const auto& field : type.fields()) {
-      if (mayHaveNaN(*field->type())) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-}  //  namespace
-
 bool ChunkedArray::Equals(const std::shared_ptr<ChunkedArray>& other,
                           const EqualOptions& opts) const {
   if (!other) {
     return false;
-  }
-  if (this == other.get() && !mayHaveNaN(*type_)) {
-    return true;
   }
   return Equals(*other.get(), opts);
 }
 
 bool ChunkedArray::ApproxEquals(const ChunkedArray& other,
                                 const EqualOptions& equal_options) const {
-  if (length_ != other.length()) {
-    return false;
+  auto resolved_options = equal_options;
+  if (!resolved_options.atol()) {
+    resolved_options = resolved_options.atol(kDefaultAbsoluteTolerance);
   }
-  if (null_count_ != other.null_count()) {
-    return false;
-  }
-  // We cannot toggle check_metadata here yet, so we don't check it
-  if (!type_->Equals(*other.type_, /*check_metadata=*/false)) {
-    return false;
-  }
-
-  // Check contents of the underlying arrays. This checks for equality of
-  // the underlying data independently of the chunk size.
-  return internal::ApplyBinaryChunked(
-             *this, other,
-             [&](const Array& left_piece, const Array& right_piece,
-                 int64_t ARROW_ARG_UNUSED(position)) {
-               if (!left_piece.ApproxEquals(right_piece, equal_options)) {
-                 return Status::Invalid("Unequal piece");
-               }
-               return Status::OK();
-             })
-      .ok();
+  return Equals(other, resolved_options);
 }
 
 Result<std::shared_ptr<Scalar>> ChunkedArray::GetScalar(int64_t index) const {
@@ -252,7 +248,7 @@ Result<std::shared_ptr<ChunkedArray>> ChunkedArray::View(
   for (int i = 0; i < this->num_chunks(); ++i) {
     ARROW_ASSIGN_OR_RAISE(out_chunks[i], chunks_[i]->View(type));
   }
-  return std::make_shared<ChunkedArray>(out_chunks, type);
+  return std::make_shared<ChunkedArray>(std::move(out_chunks), type);
 }
 
 std::string ChunkedArray::ToString() const {

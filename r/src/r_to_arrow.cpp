@@ -29,6 +29,7 @@
 #include <arrow/util/bitmap_writer.h>
 #include <arrow/util/checked_cast.h>
 #include <arrow/util/converter.h>
+#include <arrow/util/float16.h>
 #include <arrow/util/logging.h>
 
 #include "./r_task_group.h"
@@ -93,6 +94,8 @@ RVectorType GetVectorType(SEXP x) {
         return FACTOR;
       } else if (Rf_inherits(x, "Date")) {
         return DATE_INT;
+      } else if (Rf_inherits(x, "POSIXct")) {
+        return POSIXCT;
       }
       return INT32;
     case STRSXP:
@@ -123,7 +126,7 @@ RVectorType GetVectorType(SEXP x) {
         return POSIXLT;
       }
 
-      if (Rf_inherits(x, "arrow_binary")) {
+      if (Rf_inherits(x, "arrow_binary") || Rf_inherits(x, "blob")) {
         return BINARY;
       }
 
@@ -388,12 +391,12 @@ struct RConvert {
     return static_cast<float>(from);
   }
 
-  // ---- convert to half float: not implemented
+  // ---- convert to half float
   template <typename Type, typename From>
   static enable_if_t<std::is_same<Type, const HalfFloatType>::value,
                      Result<typename Type::c_type>>
   Convert(Type*, From from) {
-    return Status::Invalid("Cannot convert to Half Float");
+    return arrow::util::Float16(static_cast<double>(from)).bits();
   }
 };
 
@@ -595,11 +598,13 @@ class RPrimitiveConverter<T, enable_if_t<is_date_type<T>::value>>
     return VisitVector(it, size, append_null, append_value);
   }
 
-  static int FromRDate(const Date32Type*, double from) { return static_cast<int>(from); }
+  static int FromRDate(const Date32Type*, double from) {
+    return static_cast<int>(std::floor(from));
+  }
 
   static int64_t FromRDate(const Date64Type*, double from) {
     constexpr int64_t kMilliSecondsPerDay = 86400000;
-    return static_cast<int64_t>(from * kMilliSecondsPerDay);
+    return static_cast<int64_t>(std::floor(from * kMilliSecondsPerDay));
   }
 
   static int FromPosixct(const Date32Type*, double from) {
@@ -992,14 +997,6 @@ class RDictionaryConverter<ValueType, enable_if_has_string_view<ValueType>>
   Result<std::shared_ptr<ChunkedArray>> ToChunkedArray() override {
     ARROW_ASSIGN_OR_RAISE(auto result, this->builder_->Finish());
 
-    auto result_type = checked_cast<DictionaryType*>(result->type().get());
-    if (this->dict_type_->ordered() && !result_type->ordered()) {
-      // TODO: we should not have to do that, there is probably something wrong
-      //       in the DictionaryBuilder code
-      result->data()->type =
-          arrow::dictionary(result_type->index_type(), result_type->value_type(), true);
-    }
-
     return std::make_shared<ChunkedArray>(
         std::make_shared<DictionaryArray>(result->data()));
   }
@@ -1025,8 +1022,8 @@ class RDictionaryConverter<ValueType, enable_if_has_string_view<ValueType>>
 
     // first we need to handle the levels
     SEXP levels = Rf_getAttrib(x, R_LevelsSymbol);
-    auto memo_chunked_chunked_array =
-        arrow::r::vec_to_arrow_ChunkedArray(levels, utf8(), false);
+    auto memo_chunked_chunked_array = arrow::r::vec_to_arrow_ChunkedArray(
+        levels, this->dict_type_->value_type(), false);
     for (const auto& chunk : memo_chunked_chunked_array->chunks()) {
       RETURN_NOT_OK(this->value_builder_->InsertMemoValues(*chunk));
     }
@@ -1214,11 +1211,11 @@ bool can_reuse_memory(SEXP x, const std::shared_ptr<arrow::DataType>& type) {
   //       because MakeSimpleArray below will force materialization
   switch (type->id()) {
     case Type::INT32:
-      return TYPEOF(x) == INTSXP && !OBJECT(x);
+      return TYPEOF(x) == INTSXP && !Rf_isObject(x);
     case Type::DOUBLE:
-      return TYPEOF(x) == REALSXP && !OBJECT(x);
+      return TYPEOF(x) == REALSXP && !Rf_isObject(x);
     case Type::INT8:
-      return TYPEOF(x) == RAWSXP && !OBJECT(x);
+      return TYPEOF(x) == RAWSXP && !Rf_isObject(x);
     case Type::INT64:
       return TYPEOF(x) == REALSXP && Rf_inherits(x, "integer64");
     default:
@@ -1412,17 +1409,17 @@ bool vector_from_r_memory(SEXP x, const std::shared_ptr<DataType>& type,
 
   switch (type->id()) {
     case Type::INT32:
-      return TYPEOF(x) == INTSXP && !OBJECT(x) &&
+      return TYPEOF(x) == INTSXP && !Rf_isObject(x) &&
              vector_from_r_memory_impl<cpp11::integers, Int32Type>(x, type, columns, j,
                                                                    tasks);
 
     case Type::DOUBLE:
-      return TYPEOF(x) == REALSXP && !OBJECT(x) &&
+      return TYPEOF(x) == REALSXP && !Rf_isObject(x) &&
              vector_from_r_memory_impl<cpp11::doubles, DoubleType>(x, type, columns, j,
                                                                    tasks);
 
     case Type::UINT8:
-      return TYPEOF(x) == RAWSXP && !OBJECT(x) &&
+      return TYPEOF(x) == RAWSXP && !Rf_isObject(x) &&
              vector_from_r_memory_impl<cpp11::raws, UInt8Type>(x, type, columns, j,
                                                                tasks);
 

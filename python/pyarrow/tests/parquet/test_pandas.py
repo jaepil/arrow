@@ -27,7 +27,6 @@ import pytest
 import pyarrow as pa
 from pyarrow.fs import LocalFileSystem, SubTreeFileSystem
 from pyarrow.util import guid
-from pyarrow.vendored.version import Version
 
 try:
     import pyarrow.parquet as pq
@@ -102,6 +101,31 @@ def test_merging_parquet_tables_with_different_pandas_metadata(tempdir):
 
 
 @pytest.mark.pandas
+def test_attributes_metadata_persistence(tempdir):
+    # GH-45382: Add support for pandas DataFrame.attrs
+    # During the .parquet file writing, the attrs are serialised into json
+    # along with the rest of the pandas.DataFrame metadata.
+
+    filename = tempdir / "metadata_persistence.parquet"
+    df = alltypes_sample(size=10000)
+    df.attrs = {
+        'float16': 'half-precision',
+        'float32': 'single precision',
+        'float64': 'double precision',
+        'desciption': 'Attributes Persistence Test DataFrame',
+    }
+
+    table = pa.Table.from_pandas(df)
+    assert b'attributes' in table.schema.metadata[b'pandas']
+
+    _write_table(table, filename)
+    metadata = pq.read_metadata(filename).metadata
+    js = json.loads(metadata[b'pandas'].decode('utf8'))
+    assert 'attributes' in js
+    assert js['attributes'] == df.attrs
+
+
+@pytest.mark.pandas
 def test_pandas_parquet_column_multiindex(tempdir):
     df = alltypes_sample(size=10)
     df.columns = pd.MultiIndex.from_tuples(
@@ -121,7 +145,7 @@ def test_pandas_parquet_column_multiindex(tempdir):
 
 
 @pytest.mark.pandas
-def test_pandas_parquet_2_0_roundtrip_read_pandas_no_index_written(tempdir):
+def test_pandas_parquet_2_roundtrip_read_pandas_no_index_written(tempdir):
     df = alltypes_sample(size=10000)
 
     filename = tempdir / 'pandas_roundtrip.parquet'
@@ -270,14 +294,12 @@ def test_pandas_parquet_configuration_options(tempdir):
 
 
 @pytest.mark.pandas
-@pytest.mark.filterwarnings("ignore:Parquet format '2.0':FutureWarning")
 def test_spark_flavor_preserves_pandas_metadata():
     df = _test_dataframe(size=100)
     df.index = np.arange(0, 10 * len(df), 10)
     df.index.name = 'foo'
 
-    result = _roundtrip_pandas_dataframe(df, {'version': '2.0',
-                                              'flavor': 'spark'})
+    result = _roundtrip_pandas_dataframe(df, {'flavor': 'spark'})
     tm.assert_frame_equal(result, df)
 
 
@@ -407,22 +429,20 @@ carat        cut  color  clarity  depth  table  price     x     y     z
 
 @pytest.mark.pandas
 def test_backwards_compatible_column_metadata_handling(datadir):
-    if Version("2.2.0") <= Version(pd.__version__):
-        # TODO: regression in pandas
-        # https://github.com/pandas-dev/pandas/issues/56775
-        pytest.skip("Regression in pandas 2.2.0")
+    dates = pd.date_range(
+        "2017-01-01", periods=3, tz='Europe/Brussels'
+    ).as_unit("ns")
     expected = pd.DataFrame(
         {'a': [1, 2, 3], 'b': [.1, .2, .3],
-         'c': pd.date_range("2017-01-01", periods=3, tz='Europe/Brussels')})
+         'c': dates})
     expected.index = pd.MultiIndex.from_arrays(
-        [['a', 'b', 'c'],
-         pd.date_range("2017-01-01", periods=3, tz='Europe/Brussels')],
+        [['a', 'b', 'c'], dates],
         names=['index', None])
 
     path = datadir / 'v0.7.1.column-metadata-handling.parquet'
     table = _read_table(path)
     result = table.to_pandas()
-    tm.assert_frame_equal(result, expected)
+    tm.assert_frame_equal(result, expected, check_freq=False)
 
     table = _read_table(
         path, columns=['a'])
@@ -449,7 +469,7 @@ def test_categorical_index_survives_roundtrip():
 def test_categorical_order_survives_roundtrip():
     # ARROW-6302
     df = pd.DataFrame({"a": pd.Categorical(
-        ["a", "b", "c", "a"], categories=["b", "c", "d"], ordered=True)})
+        ["d", "b", "c", None], categories=["b", "c", "d"], ordered=True)})
 
     table = pa.Table.from_pandas(df)
     bos = pa.BufferOutputStream()
@@ -501,9 +521,6 @@ def test_pandas_categorical_roundtrip():
 @pytest.mark.pandas
 def test_categories_with_string_pyarrow_dtype(tempdir):
     # gh-33727: writing to parquet should not fail
-    if Version(pd.__version__) < Version("1.3.0"):
-        pytest.skip("PyArrow backed string data type introduced in pandas 1.3.0")
-
     df1 = pd.DataFrame({"x": ["foo", "bar", "foo"]}, dtype="string[pyarrow]")
     df1 = df1.astype("category")
 
@@ -590,7 +607,7 @@ def test_dataset_read_pandas_common_metadata(
             np.arange(i * size, (i + 1) * size, dtype="int64"), name='index'
         )
 
-        path = dirpath / '{}.parquet'.format(i)
+        path = dirpath / f'{i}.parquet'
 
         table = pa.Table.from_pandas(df, preserve_index=preserve_index)
 

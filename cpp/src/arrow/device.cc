@@ -27,7 +27,7 @@
 #include "arrow/io/memory.h"
 #include "arrow/record_batch.h"
 #include "arrow/result.h"
-#include "arrow/util/logging.h"
+#include "arrow/util/logging_internal.h"
 
 namespace arrow {
 
@@ -42,8 +42,7 @@ Result<std::shared_ptr<Device::SyncEvent>> MemoryManager::WrapDeviceSyncEvent(
   return nullptr;
 }
 
-Device::~Device() {}
-
+Device::~Device(){}
 #define COPY_BUFFER_SUCCESS(maybe_buffer) \
   ((maybe_buffer).ok() && *(maybe_buffer) != nullptr)
 
